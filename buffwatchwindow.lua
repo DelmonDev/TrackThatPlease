@@ -1,4 +1,3 @@
-local api = require("api")
 local BuffList = require("TrackThatPlease/buff_helper")
 
 local BuffWatchWindow = {}
@@ -8,19 +7,20 @@ local buffSelectionWindow
 local buffScrollList
 local searchEditBox
 local categoryDropdown
-local trackTypeDropdown
+local AllBuffsIndex = {}
+local AllBuffs = {}
+local allSelected = false
+local filteredCountLabel
 
 -- Settings and data
 local settings
-local playerWatchedBuffs = {}
-local targetWatchedBuffs = {}
-local currentTrackType = 1  -- 1 for Player, 2 for Target
+local watchedBuffs = {}
+local filteredBuffs = {}
 
 -- Scroll and pagination
-local pageSize = 20
-local currentCategory = 1  -- "Watched Buffs" as default
-local categories = {"All Buffs", "Player Buffs", "Target Buffs"}
-local trackTypes = {"Player", "Target"}
+local pageSize = 50
+local currentCategory = 2  -- "Watched Buffs" as default
+local categories = {"All Buffs", "Watched Buffs"}
 
 -- Helper functions for number serialization
 local function SerializeNumber(num)
@@ -33,33 +33,19 @@ end
 
 -- Function to save settings
 local function SaveSettings()
-    local savedPlayerBuffs = {}
-    local savedTargetBuffs = {}
-    
-    for _, id in ipairs(playerWatchedBuffs) do
-        table.insert(savedPlayerBuffs, SerializeNumber(id))
+    local savedBuffs = {}
+    for id, _ in pairs(watchedBuffs) do
+        table.insert(savedBuffs, SerializeNumber(id))
     end
-    
-    for _, id in ipairs(targetWatchedBuffs) do
-        table.insert(savedTargetBuffs, SerializeNumber(id))
-    end
-    
-    settings.playerWatchedBuffs = savedPlayerBuffs
-    settings.targetWatchedBuffs = savedTargetBuffs
+    settings.watchedBuffs = savedBuffs
+
     api.SaveSettings()
+    --api.Log:Err("Settings saved with watched buffs count: " .. #savedBuffs)
 end
 
 -- Update the appearance of a buff icon
 local function UpdateIconAppearance(subItem, buffId)
-    local isWatched = false
-    
-    if currentTrackType == 1 then -- Player
-        isWatched = BuffWatchWindow.IsPlayerBuffWatched(buffId)
-    else -- Target
-        isWatched = BuffWatchWindow.IsTargetBuffWatched(buffId)
-    end
-    
-    if isWatched then
+    if BuffWatchWindow.IsBuffWatched(buffId) then
         subItem.checkmarkIcon:SetCoords(852,49,15,15)
     else
         subItem.checkmarkIcon:SetCoords(832,49,15,15)
@@ -70,11 +56,11 @@ end
 -- Set data for each buff item in the list
 local function DataSetFunc(subItem, data, setValue)
     if setValue then
-        local str = string.format("%s", data.name)
+        local str = string.format("(%d) %s", data.id, data.name)
         local id = data.id
         subItem.id = id
         subItem.textbox:SetText(str)
-        F_SLOT.SetIconBackGround(subItem.subItemIcon, BuffList.GetBuffIcon(id))
+        F_SLOT.SetIconBackGround(subItem.subItemIcon, data.iconPath)
         UpdateIconAppearance(subItem, id)
     end
 end
@@ -94,19 +80,19 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
     subItemIcon:AddAnchor("LEFT", subItem, 5, 2)
     subItem.subItemIcon = subItemIcon
 
-    subItem:SetExtent(380, 30)
+    subItem:SetExtent(440, 30)
     local textbox = subItem:CreateChildWidget("textbox", "textbox", 0, true)
     textbox:AddAnchor("TOPLEFT", subItem, 43, 2)
     textbox:AddAnchor("BOTTOMRIGHT", subItem, 0, 0)
     textbox.style:SetAlign(ALIGN.LEFT)
-    textbox.style:SetFontSize(FONT_SIZE.LARGE)
+    textbox.style:SetFontSize(14)
     ApplyTextColor(textbox, FONT_COLOR.WHITE)
     subItem.textbox = textbox
 
     -- checkmark config
     local checkmarkIcon = subItem:CreateImageDrawable(TEXTURE_PATH.HUD, "overlay")
     checkmarkIcon:SetExtent(14, 14)
-    checkmarkIcon:AddAnchor("TOPRIGHT", subItemIcon, 260, 10)
+    checkmarkIcon:AddAnchor("TOPRIGHT", subItemIcon, 300, 10)
     checkmarkIcon:Show(true)
     subItem.checkmarkIcon = checkmarkIcon
 
@@ -137,33 +123,38 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
     buffScrollList:DeleteAllDatas()
     
     local count = 1
-    local filteredBuffs = {}
-    
-    local function addBuff(buff)
-        if searchText == "" or string.find(buff.name:lower(), searchText:lower()) then
-            table.insert(filteredBuffs, buff)
-        end
-    end
+    filteredBuffs = {}
 
     if currentCategory == 1 then  -- All Buffs
-        for _, buff in ipairs(BuffList.ALL_BUFFS) do
-            addBuff(buff)
+        if string.len(searchText) < 3 then
+            if buffScrollList:GetDataCount() == #AllBuffs then
+                return  -- No need to filter if already showing all buffs
+            end
+            for i, buff in ipairs(AllBuffs) do
+                table.insert(filteredBuffs, buff)
+            end
+        else
+            filteredBuffs = BuffList.searchNgram(searchText)
         end
-    elseif currentCategory == 2 then  -- Player Buffs
-        for _, buff in ipairs(BuffList.ALL_BUFFS) do
-            if BuffWatchWindow.IsPlayerBuffWatched(buff.id) then
-                addBuff(buff)
+    elseif currentCategory == 2 then  -- Watched Buffs
+        for id, _ in pairs(watchedBuffs) do
+            local buff = AllBuffsIndex[id]
+            if buff then
+                if searchText == "" or string.find(buff.name:lower(), searchText:lower()) then
+                    table.insert(filteredBuffs, buff)
+                end
+            else
+                api.Log:Err("Buff with ID " .. tostring(id) .. " not found in AllBuffs")
             end
         end
-    elseif currentCategory == 3 then  -- Target Buffs
-        for _, buff in ipairs(BuffList.ALL_BUFFS) do
-            if BuffWatchWindow.IsTargetBuffWatched(buff.id) then
-                addBuff(buff)
-            end
-        end
+
+        table.sort(filteredBuffs, function(a, b)
+            return (a.name or ""):lower() < (b.name or ""):lower()
+        end)
     end
-    
+
     updatePageCount(#filteredBuffs)
+    filteredCountLabel:SetText("Count: " .. tostring(#filteredBuffs))
 
     for i = startingIndex, math.min(startingIndex + pageSize - 1, #filteredBuffs) do
         local buff = filteredBuffs[i]
@@ -171,6 +162,7 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
             local buffData = {
                 id = buff.id,
                 name = buff.name,
+                iconPath = buff.iconPath,
                 isViewData = true,
                 isAbstention = false
             }
@@ -180,78 +172,21 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
     end
 end
 
--- Toggle a buff's watched status based on current tracking type
+-- Toggle a buff's watched status
 function BuffWatchWindow.ToggleBuffWatch(buffId)
     buffId = DeserializeNumber(SerializeNumber(buffId))
-    
-    if currentTrackType == 1 then -- Player
-        BuffWatchWindow.TogglePlayerBuffWatch(buffId)
-    else -- Target
-        BuffWatchWindow.ToggleTargetBuffWatch(buffId)
-    end
-end
-
--- Toggle a player buff's watched status
-function BuffWatchWindow.TogglePlayerBuffWatch(buffId)
-    buffId = DeserializeNumber(SerializeNumber(buffId))
-    local index = nil
-    for i, id in ipairs(playerWatchedBuffs) do
-        if id == buffId then
-            index = i
-            break
-        end
-    end
-    
-    if index then
-        table.remove(playerWatchedBuffs, index)
+    if watchedBuffs[buffId] then
+        watchedBuffs[buffId] = nil
     else
-        table.insert(playerWatchedBuffs, buffId)
+        watchedBuffs[buffId] = true
     end
 end
 
--- Toggle a target buff's watched status
-function BuffWatchWindow.ToggleTargetBuffWatch(buffId)
-    buffId = DeserializeNumber(SerializeNumber(buffId))
-    local index = nil
-    for i, id in ipairs(targetWatchedBuffs) do
-        if id == buffId then
-            index = i
-            break
-        end
-    end
-    
-    if index then
-        table.remove(targetWatchedBuffs, index)
-    else
-        table.insert(targetWatchedBuffs, buffId)
-    end
-end
-
--- Check if a buff is being watched (general function used by main.lua)
+-- Check if a buff is being watched
 function BuffWatchWindow.IsBuffWatched(buffId)
-    return BuffWatchWindow.IsPlayerBuffWatched(buffId) or BuffWatchWindow.IsTargetBuffWatched(buffId)
-end
 
--- Check if a player buff is being watched
-function BuffWatchWindow.IsPlayerBuffWatched(buffId)
     buffId = DeserializeNumber(SerializeNumber(buffId))
-    for _, id in ipairs(playerWatchedBuffs) do
-        if id == buffId then
-            return true
-        end
-    end
-    return false
-end
-
--- Check if a target buff is being watched
-function BuffWatchWindow.IsTargetBuffWatched(buffId)
-    buffId = DeserializeNumber(SerializeNumber(buffId))
-    for _, id in ipairs(targetWatchedBuffs) do
-        if id == buffId then
-            return true
-        end
-    end
-    return false
+    return watchedBuffs[buffId] ~= nil
 end
 
 -- Toggle the buff selection window visibility
@@ -275,68 +210,40 @@ end
 -- Initialize the BuffWatchWindow
 function BuffWatchWindow.Initialize(addonSettings)
     settings = api.GetSettings("TrackThatPlease") or {}
+    local savedBuffs = settings.watchedBuffs or {}
+    local buffs = BuffList.GetAllBuffs()  -- Load all buffs from the helper module
+    AllBuffsIndex = buffs.AllBuffsIndex
+    AllBuffs = buffs.AllBuffs
+    api.AllBuffsIndex = AllBuffsIndex  -- Make it globally accessible
     
-    -- Load player buffs
-    local savedPlayerBuffs = settings.playerWatchedBuffs or {}
-    playerWatchedBuffs = {}
-    for _, idString in ipairs(savedPlayerBuffs) do
-        table.insert(playerWatchedBuffs, DeserializeNumber(idString))
+    for _, idString in ipairs(savedBuffs) do
+        watchedBuffs[DeserializeNumber(idString)] = true
     end
-    
-    -- Load target buffs
-    local savedTargetBuffs = settings.targetWatchedBuffs or {}
-    targetWatchedBuffs = {}
-    for _, idString in ipairs(savedTargetBuffs) do
-        table.insert(targetWatchedBuffs, DeserializeNumber(idString))
-    end
-    
-    -- Backward compatibility for existing users
-    if settings.watchedBuffs and (#playerWatchedBuffs == 0 and #targetWatchedBuffs == 0) then
-        for _, idString in ipairs(settings.watchedBuffs) do
-            table.insert(playerWatchedBuffs, DeserializeNumber(idString))
-            table.insert(targetWatchedBuffs, DeserializeNumber(idString))
-        end
-    end
+
     
     -- Create the main window
-    buffSelectionWindow = api.Interface:CreateWindow("buffSelectorWindow", "Track List")
-    buffSelectionWindow:SetWidth(450)
-    buffSelectionWindow:SetHeight(700)
-    
-    -- Create the track type selector
-    local trackTypeLabel = buffSelectionWindow:CreateChildWidget("label", "trackTypeLabel", 0, true)
-    trackTypeLabel:SetText("Track Type:")
-    trackTypeLabel.style:SetAlign(ALIGN.LEFT)
-    trackTypeLabel.style:SetFontSize(FONT_SIZE.LARGE)
-    ApplyTextColor(trackTypeLabel, FONT_COLOR.BLACK)
-    trackTypeLabel:AddAnchor("TOPLEFT", buffSelectionWindow, 75, 60)
-    
-    trackTypeDropdown = api.Interface:CreateComboBox(buffSelectionWindow)
-    trackTypeDropdown:AddAnchor("TOPLEFT", trackTypeLabel, "BOTTOMLEFT", 0, 15)
-    trackTypeDropdown:SetWidth(300)
-    trackTypeDropdown.style:SetFontSize(FONT_SIZE.LARGE)
-    trackTypeDropdown.dropdownItem = trackTypes
-    trackTypeDropdown:Select(1)  -- "Player" as default
+    buffSelectionWindow = api.Interface:CreateWindow("buffSelectorWindow", "Track Target List")
+    buffSelectionWindow:SetWidth(475)
+    buffSelectionWindow:SetHeight(750)
+    buffSelectionWindow:RemoveAllAnchors()
+    buffSelectionWindow:AddAnchor("CENTER", "UIParent", "CENTER", 0, 0)
+    local childrenWidth = 360
     
     -- Create the search box
     local searchLabel = buffSelectionWindow:CreateChildWidget("label", "searchLabel", 0, true)
-    searchLabel:SetText("Search Name/ID:")
+    searchLabel:SetText("Search Name")
     searchLabel.style:SetAlign(ALIGN.LEFT)
     searchLabel.style:SetFontSize(FONT_SIZE.LARGE)
     ApplyTextColor(searchLabel, FONT_COLOR.BLACK)
-    searchLabel:AddAnchor("TOPLEFT", trackTypeDropdown, "BOTTOMLEFT", 0, 30)
+    searchLabel:AddAnchor("TOPLEFT", buffSelectionWindow, 75, 60)
 
     searchEditBox = W_CTRL.CreateEdit("searchEditBox", buffSelectionWindow)
-    searchEditBox:SetExtent(300, 24)
+    searchEditBox:SetExtent(childrenWidth, 24)
     searchEditBox:AddAnchor("TOPLEFT", searchLabel, "BOTTOMLEFT", 0, 15)
     searchEditBox.style:SetFontSize(FONT_SIZE.LARGE)
     
     function searchEditBox:OnTextChanged()
         local searchText = searchEditBox:GetText()
-        if searchText ~= "" and currentCategory ~= 1 then
-            currentCategory = 1  -- Switch to "All Buffs"
-            categoryDropdown:Select(1)
-        end
         fillBuffData(buffScrollList, 1, searchText)
     end
     searchEditBox:SetHandler("OnTextChanged", searchEditBox.OnTextChanged)
@@ -351,28 +258,67 @@ function BuffWatchWindow.Initialize(addonSettings)
 
     categoryDropdown = api.Interface:CreateComboBox(buffSelectionWindow)
     categoryDropdown:AddAnchor("TOPLEFT", categoryLabel, "BOTTOMLEFT", 0, 15)
-    categoryDropdown:SetWidth(300)
+    categoryDropdown:SetWidth(childrenWidth)
     categoryDropdown.style:SetFontSize(FONT_SIZE.LARGE)
     categoryDropdown.dropdownItem = categories
-    categoryDropdown:Select(1)  -- "Player Buffs" as default
+    categoryDropdown:Select(2)  -- "Watched Buffs" as default
     
     -- Create the buff scroll list
     buffScrollList = W_CTRL.CreatePageScrollListCtrl("buffScrollList", buffSelectionWindow)
-    buffScrollList:SetWidth(380)
-    buffScrollList:AddAnchor("TOPLEFT", categoryDropdown, "BOTTOMLEFT", 0, 15)
+    buffScrollList:SetWidth(childrenWidth + 60)
+    buffScrollList:AddAnchor("TOPLEFT", categoryDropdown, "BOTTOMLEFT", 0, 35)
     buffScrollList:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, -4, -40)
-    buffScrollList:InsertColumn("", 380, 0, DataSetFunc, nil, nil, LayoutSetFunc)
+    buffScrollList:InsertColumn("", childrenWidth + 60, 0, DataSetFunc, nil, nil, LayoutSetFunc)
     buffScrollList:InsertRows(10, false)
     buffScrollList:SetColumnHeight(-3)
-    
-    function trackTypeDropdown:SelectedProc()
-        currentTrackType = self:GetSelectedIndex()
-        fillBuffData(buffScrollList, 1, searchEditBox:GetText())
+
+    -- Create select all button
+    local selectAllButton = buffSelectionWindow:CreateChildWidget("button", "selectAllButton", 0, true)
+    selectAllButton:SetText("Select All")
+    selectAllButton:AddAnchor("TOPRIGHT", categoryDropdown, "BOTTOMRIGHT", 0, 8)
+    ApplyButtonSkin(selectAllButton, BUTTON_BASIC.DEFAULT)
+    selectAllButton:SetExtent(78, 25)
+    selectAllButton.style:SetFontSize(11)
+    -- Set colors
+    selectAllButton:SetTextColor(unpack(FONT_COLOR.DEFAULT))
+    selectAllButton:SetHighlightTextColor(unpack(FONT_COLOR.DEFAULT))
+    selectAllButton:SetPushedTextColor(unpack(FONT_COLOR.DEFAULT))
+    selectAllButton:SetDisabledTextColor(unpack(FONT_COLOR.DEFAULT))
+
+    -- Filter count label
+    filteredCountLabel = buffSelectionWindow:CreateChildWidget("label", "filteredCountLabel", 0, true)
+    filteredCountLabel:SetText("0")
+    ApplyTextColor(filteredCountLabel, FONT_COLOR.DEFAULT)
+    filteredCountLabel.style:SetAlign(ALIGN.LEFT)
+    filteredCountLabel.style:SetFontSize(12)
+    filteredCountLabel:AddAnchor("TOPLEFT", categoryDropdown, "BOTTOMLEFT", 0, 15)
+
+    function selectAllButton:OnClick()
+        if not allSelected then
+            for i, buff in ipairs(filteredBuffs) do
+                watchedBuffs[buff.id] = true
+            end
+            selectAllButton:SetText("Unselect All")
+            allSelected = true
+        else
+            for i, buff in ipairs(filteredBuffs) do
+                watchedBuffs[buff.id] = nil
+            end
+            selectAllButton:SetText("Select All")
+            allSelected = false
+        end
+            SaveSettings()
+            fillBuffData(buffScrollList, 1, searchEditBox:GetText())
     end
-    
+    selectAllButton:SetHandler("OnClick", selectAllButton.OnClick)
+
     function categoryDropdown:SelectedProc()
-        currentCategory = self:GetSelectedIndex()
-        fillBuffData(buffScrollList, 1, searchEditBox:GetText())
+        local newCategory = self:GetSelectedIndex()
+        if newCategory ~= currentCategory then
+            currentCategory = newCategory
+            searchEditBox:SetText("")  -- Clear search text when changing category
+            fillBuffData(buffScrollList, 1, searchEditBox:GetText())
+        end
     end
     
     function buffScrollList:OnPageChangedProc(curPageIdx)

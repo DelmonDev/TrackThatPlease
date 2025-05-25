@@ -1,25 +1,20 @@
-local api = require("api")
 local BuffWatchWindow = require("TrackThatPlease/buffwatchwindow")
 
 -- Addon Information
 local TargetBuffTrackerAddon = {
     name = "TrackThatPlease",
-    author = "Dehling",
-    version = "1.0",
+    author = "Dehling/Fortuno",
+    version = "2.0",
     desc = "Tracks buffs/debuffs on target, with UI"
 }
 
 --FORK Option by @Fortuno for colored buff debuff borders
---FORK Idea by @mykeew to implement targeting for Target and Self (Player), now properly implemented
---
+
 -- UI Elements
-local playerBuffCanvas
-local targetBuffCanvas
-local MAX_BUFFS_SHOWN = 5
-local playerBuffIcons = {}
-local playerBuffLabels = {}
-local targetBuffIcons = {}
-local targetBuffLabels = {}
+local buffTrackerCanvas
+local MAX_BUFFS_SHOWN = 8
+local buffIcons = {}
+local buffLabels = {}
 
 -- Variables
 local previousXYZ = "0,0,0"
@@ -28,11 +23,10 @@ local previousTarget
 -- THIS RIGHT HERE ARE THE SETTINGS, 
 local settings = {
     ShowTimers = true,
-    IconSize = 25,
+    IconSize = 34,
     IconSpacing = 3,
     UISize = 100, -- 80, 90 ,100, 110, 120
-    RecolorIconBorders = true,  -- New setting for toggling icon border recoloring
-    TargetBuffVerticalOffset = -35  -- New setting for target buff vertical offset
+    RecolorIconBorders = true  -- New setting for toggling icon border recoloring
 }
 
 --ICON BACKGROUNDS IF BUFF OR DEBUFF
@@ -81,31 +75,28 @@ DEBUFF = {
     }
 }
 --------------------------------------------------------------------------------------------------------------------------------------------
--- Function to check if a buff is being watched for player or target
-local function IsWatchedBuff(buffId, isPlayer)
-    buffId = math.floor(tonumber(buffId) or 0)
-    if isPlayer then
-        return BuffWatchWindow.IsPlayerBuffWatched(buffId)
-    else
-        return BuffWatchWindow.IsTargetBuffWatched(buffId)
-    end
+-- Function to check if a buff is being watched
+local function IsWatchedBuff(buffId)
+    return BuffWatchWindow.IsBuffWatched(math.floor(tonumber(buffId) or 0))
 end
 
 -- Function to create buff icon and label
-local function CreateBuffElement(index, canvas)
-    local icon = CreateItemIconButton("buffIcon" .. index, canvas)
+local function CreateBuffElement(index)
+    local icon = CreateItemIconButton("targetBuffIcon" .. index, buffTrackerCanvas)
     icon:Clickable(false)
     icon:SetExtent(settings.IconSize, settings.IconSize)
     icon:Show(false)
-    F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
 
     local label
     if settings.ShowTimers then
-        label = canvas:CreateChildWidget("label", "buffTimeLeftLabel" .. index, 0, true)
+        label = buffTrackerCanvas:CreateChildWidget("label", "buffTimeLeftLabel" .. index, 0, true)
         label:SetText("")
         label:AddAnchor("CENTER", icon, "CENTER", 0, 0)
+        --label:AddAnchor("BOTTOM", icon, "TOP", 0, -5)
         label.style:SetFontSize(12)
-        label.style:SetAlign(ALIGN.CENTER)
+
+        label.style:SetOutline(true)
+        label.style:SetAlign(ALIGN_CENTER)
         label.style:SetShadow(true)
         label:Show(false)
     end
@@ -114,15 +105,15 @@ local function CreateBuffElement(index, canvas)
 end
 
 -- Function to position buffs with whole bar centered
-local function PositionBuffs(watchedBuffs, canvas, icons, labels)
+local function PositionBuffs(watchedBuffs)
     local totalWidth = #watchedBuffs * settings.IconSize + (#watchedBuffs - 1) * settings.IconSpacing
     local startX = -totalWidth / 2 + settings.IconSize / 2
     
     for i = 1, #watchedBuffs do
-        local icon = icons[i]
+        local icon = buffIcons[i]
         local offsetX = startX + (i - 1) * (settings.IconSize + settings.IconSpacing)
         icon:RemoveAllAnchors()
-        icon:AddAnchor("CENTER", canvas, "CENTER", offsetX, 0)
+        icon:AddAnchor("CENTER", buffTrackerCanvas, "CENTER", offsetX, 0)
     end
 end
 
@@ -140,81 +131,69 @@ end
 
 -- Function to collect all watched buffs and debuffs
 local function CollectWatchedBuffsAndDebuffs()
-    local playerBuffs = {}
-    local targetBuffs = {}
-
-    -- Helper function to collect buffs and debuffs from a unit
-    local function CollectBuffsAndDebuffs(unit, buffList, isPlayer)
-        -- Check buffs
-        local buffCount = api.Unit:UnitBuffCount(unit) or 0
-        for i = 1, buffCount do
-            local buff = api.Unit:UnitBuff(unit, i)
-            if buff and IsWatchedBuff(buff.buff_id, isPlayer) then
-                buff.isBuff = true
-                table.insert(buffList, buff)
-            end
-        end
-
-        -- Check debuffs
-        local debuffCount = api.Unit:UnitDeBuffCount(unit) or 0
-        for i = 1, debuffCount do
-            local debuff = api.Unit:UnitDeBuff(unit, i)
-            if debuff and IsWatchedBuff(debuff.buff_id, isPlayer) then
-                debuff.isBuff = false
-                table.insert(buffList, debuff)
-            end
+    local watchedBuffs = {}
+    
+    -- Check buffs
+    local buffCount = api.Unit:UnitBuffCount("target") or 0
+    for i = 1, buffCount do
+        local buff = api.Unit:UnitBuff("target", i)
+        if buff and IsWatchedBuff(buff.buff_id) then
+           
+            buff.isBuff = true
+            table.insert(watchedBuffs, buff)
         end
     end
-
-    -- Collect buffs and debuffs from the player
-    CollectBuffsAndDebuffs("player", playerBuffs, true)
-
-    -- Collect buffs and debuffs from the target
-    CollectBuffsAndDebuffs("target", targetBuffs, false)
-
-    return playerBuffs, targetBuffs
-end
-
--- Function to clear all buff icons and labels
-local function ClearAllBuffs()
-    for i = 1, MAX_BUFFS_SHOWN do
-        if playerBuffIcons[i] then
-            playerBuffIcons[i]:Show(false)
-        end
-        if playerBuffLabels[i] then
-            playerBuffLabels[i]:Show(false)
-        end
-        if targetBuffIcons[i] then
-            targetBuffIcons[i]:Show(false)
-        end
-        if targetBuffLabels[i] then
-            targetBuffLabels[i]:Show(false)
+    
+    -- Check debuffs
+    local debuffCount = api.Unit:UnitDeBuffCount("target") or 0
+    for i = 1, debuffCount do
+        local debuff = api.Unit:UnitDeBuff("target", i)
+        if debuff and IsWatchedBuff(debuff.buff_id) then
+            debuff.isBuff = false
+            table.insert(watchedBuffs, debuff)
         end
     end
+    
+    return watchedBuffs
 end
 
--- Update event to handle buff/debuff updates
-local function OnUpdate()
-    -- Clear all buffs before updating
-    ClearAllBuffs()
+-- Update event to handle player tracking and buff/debuff update
+local function GetBlinkAlpha(minAlpha, maxAlpha, timer, speed)
+    local amplitude = (maxAlpha - minAlpha) / 2
+    local mid = (maxAlpha + minAlpha) / 2
+    return mid + amplitude * math.sin(timer * speed)
+end
 
-    -- [NEW CODE START] Check if player is targeting themselves
-    local playerUnitId = api.Unit:GetUnitId("player")
-    local targetUnitId = api.Unit:GetUnitId("target")
-    local isSelfTarget = (playerUnitId == targetUnitId)
-    -- [NEW CODE END]
+local blinkTimer = 0
+local function OnUpdate(dt)
+    blinkTimer = blinkTimer + dt / 1000
+    local currentTarget = api.Unit:GetUnitId("target")
+    
+    -- Calculate when to move the anchor for the buff tracker
+    local x, y, z = api.Unit:GetUnitScreenPosition("target")
+
+    -- If you switch targets or player is nil, hide all buffs
+    if currentTarget == nil or currentTarget ~= previousTarget then
+        for i = 1, MAX_BUFFS_SHOWN do
+            buffIcons[i]:Show(false)
+            if buffLabels[i] then buffLabels[i]:Show(false) end
+        end
+        buffTrackerCanvas:Show(false)
+        previousTarget = currentTarget
+        return
+    end
 
     -- Collect all watched buffs and debuffs
-    local playerBuffs, targetBuffs = CollectWatchedBuffsAndDebuffs()
+    local watchedBuffs = CollectWatchedBuffsAndDebuffs()
 
-    -- Update position and show player buffs/debuffs
-    if #playerBuffs > 0 then
-        PositionBuffs(playerBuffs, playerBuffCanvas, playerBuffIcons, playerBuffLabels)
+    -- Update position and show watched buffs/debuffs
+    if #watchedBuffs > 0 then
+        PositionBuffs(watchedBuffs)
 
-        for i = 1, math.min(#playerBuffs, MAX_BUFFS_SHOWN) do
-            local buff = playerBuffs[i]
-            local icon = playerBuffIcons[i]
-            local label = playerBuffLabels[i]
+        for i = 1, math.min(#watchedBuffs, MAX_BUFFS_SHOWN) do
+            local buff = watchedBuffs[i]
+            local icon = buffIcons[i]
+            local label = buffLabels[i]
 
             F_SLOT.SetIconBackGround(icon, buff.path)
             if settings.RecolorIconBorders then
@@ -230,7 +209,24 @@ local function OnUpdate()
             
             if settings.ShowTimers and label then
                 if buff.timeLeft and buff.timeLeft > 0 then
-                    label:SetText(string.format("%.1f", (buff.timeLeft / 1000)))
+                    local shouldBlink = (buff.isBuff and buff.timeLeft < 3000) or (not buff.isBuff and buff.timeLeft < 2000)
+                    if shouldBlink then
+                        local blinkSpeed =  4
+                        local alpha = GetBlinkAlpha(0.5, 1, blinkTimer, blinkSpeed)
+                        icon:SetAlpha(alpha)
+                        label:SetAlpha(alpha)
+                        label:SetText(string.format("%.1f", (buff.timeLeft / 1000)))
+                    else
+                        label:SetAlpha(1)
+                        icon:SetAlpha(1)
+                        if buff.timeLeft > 60000 then
+                            label:SetText(string.format("%dm", math.floor(buff.timeLeft / 60000)))
+                        else
+                            label:SetText(string.format("%d", (buff.timeLeft / 1000)))
+                        end
+                    end
+
+                    
                 else
                     label:SetText("")
                 end
@@ -239,78 +235,27 @@ local function OnUpdate()
         end
 
         -- Hide unused buff slots
-        for i = #playerBuffs + 1, MAX_BUFFS_SHOWN do
-            playerBuffIcons[i]:Show(false)
-            if playerBuffLabels[i] then playerBuffLabels[i]:Show(false) end
+        for i = #watchedBuffs + 1, MAX_BUFFS_SHOWN do
+            buffIcons[i]:Show(false)
+            if buffLabels[i] then buffLabels[i]:Show(false) end
         end
 
-        -- Update canvas position with UI scale adjustment
-        local x, y, z = api.Unit:GetUnitScreenPosition("player")
-        if previousXYZ ~= (x .. "," .. y .. "," .. z) then
+--[[         -- Update canvas position with UI scale adjustment
+        if previousXYZ ~= (x .. "," .. y .. "," .. z) then ]]
             local adjustment = GetPositionAdjustment()
             local baseOffsetY = -35  -- Base vertical offset
-            playerBuffCanvas:RemoveAllAnchors()
-            playerBuffCanvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", x + adjustment.x, y + baseOffsetY + adjustment.y)
-            previousXYZ = x .. "," .. y .. "," .. z
-        end
+            buffTrackerCanvas:RemoveAllAnchors()
+            buffTrackerCanvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", x + adjustment.x, y + baseOffsetY + adjustment.y)
+--[[             previousXYZ = x .. "," .. y .. "," .. z
+        end ]]
 
-        playerBuffCanvas:Show(z >= 0 and z <= 100)
+        buffTrackerCanvas:Show(z >= 0 and z <= 100)
     else
-        playerBuffCanvas:Show(false)
+        blinkTimer = 0
+        buffTrackerCanvas:Show(false)
     end
 
-    -- [MODIFIED CODE START] Update position and show target buffs/debuffs (only if not self-targeting)
-    if not isSelfTarget and #targetBuffs > 0 then
-    -- [MODIFIED CODE END]
-        PositionBuffs(targetBuffs, targetBuffCanvas, targetBuffIcons, targetBuffLabels)
-
-        for i = 1, math.min(#targetBuffs, MAX_BUFFS_SHOWN) do
-            local buff = targetBuffs[i]
-            local icon = targetBuffIcons[i]
-            local label = targetBuffLabels[i]
-
-            F_SLOT.SetIconBackGround(icon, buff.path)
-            if settings.RecolorIconBorders then
-                if buff.isBuff then
-                    F_SLOT.ApplySlotSkin(icon, icon.back, BUFF)
-                else
-                    F_SLOT.ApplySlotSkin(icon, icon.back, DEBUFF)
-                end
-            else
-                F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
-            end
-            icon:Show(true)
-            
-            if settings.ShowTimers and label then
-                if buff.timeLeft and buff.timeLeft > 0 then
-                    label:SetText(string.format("%.1f", (buff.timeLeft / 1000)))
-                else
-                    label:SetText("")
-                end
-                label:Show(true)
-            end
-        end
-
-        -- Hide unused buff slots
-        for i = #targetBuffs + 1, MAX_BUFFS_SHOWN do
-            targetBuffIcons[i]:Show(false)
-            if targetBuffLabels[i] then targetBuffLabels[i]:Show(false) end
-        end
-
-        -- Update canvas position with UI scale adjustment
-        local x, y, z = api.Unit:GetUnitScreenPosition("target")
-        if previousTarget ~= (x .. "," .. y .. "," .. z) then
-            local adjustment = GetPositionAdjustment()
-            local baseOffsetY = settings.TargetBuffVerticalOffset  -- Use the new setting for target buff vertical offset
-            targetBuffCanvas:RemoveAllAnchors()
-            targetBuffCanvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", x + adjustment.x, y + baseOffsetY + adjustment.y)
-            previousTarget = x .. "," .. y .. "," .. z
-        end
-
-        targetBuffCanvas:Show(z >= 0 and z <= 100)
-    else
-        targetBuffCanvas:Show(false)
-    end
+    previousTarget = currentTarget
 end
 
 local function HandleChatCommand(channel, unit, isHostile, name, message, speakerInChatBound, specifyName, factionName, trialPosition)
@@ -322,7 +267,7 @@ end
 
 -- Load function to initialize the UI elements
 local function OnLoad()
-    api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to access the TrackList")
+    api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to acces the TrackList")
     local savedSettings = api.GetSettings("TrackThatPlease")
     if savedSettings then
         for k, v in pairs(savedSettings) do
@@ -335,38 +280,29 @@ local function OnLoad()
         settings.RecolorIconBorders = true
     end
 
-    playerBuffCanvas = api.Interface:CreateEmptyWindow("playerBuffCanvas")
-    playerBuffCanvas:SetExtent(settings.IconSize * MAX_BUFFS_SHOWN + (MAX_BUFFS_SHOWN - 1) * settings.IconSpacing, settings.IconSize)
-    playerBuffCanvas:Show(false)
-    playerBuffCanvas:Clickable(false)
-
-    targetBuffCanvas = api.Interface:CreateEmptyWindow("targetBuffCanvas")
-    targetBuffCanvas:SetExtent(settings.IconSize * MAX_BUFFS_SHOWN + (MAX_BUFFS_SHOWN - 1) * settings.IconSpacing, settings.IconSize)
-    targetBuffCanvas:Show(false)
-    targetBuffCanvas:Clickable(false)
-
+    buffTrackerCanvas = api.Interface:CreateEmptyWindow("buffTargetOnMe")
+    buffTrackerCanvas:SetExtent(settings.IconSize * MAX_BUFFS_SHOWN + (MAX_BUFFS_SHOWN - 1) * settings.IconSpacing, settings.IconSize)
+    buffTrackerCanvas:Show(false)
+    buffTrackerCanvas:Clickable(false)
+    
     for i = 1, MAX_BUFFS_SHOWN do
-        playerBuffIcons[i], playerBuffLabels[i] = CreateBuffElement(i, playerBuffCanvas)
-        targetBuffIcons[i], targetBuffLabels[i] = CreateBuffElement(i, targetBuffCanvas)
+        buffIcons[i], buffLabels[i] = CreateBuffElement(i)
     end
-
+    
     api.On("UPDATE", OnUpdate)
     api.On("CHAT_MESSAGE", HandleChatCommand)
-
-    BuffWatchWindow.Initialize(settings)
+    
+    BuffWatchWindow.Initialize()
 end
 
 -- Unload function to clean up
 local function OnUnload()
-    -- Clear all buffs before unloading
-    ClearAllBuffs()
-
     if buffTrackerCanvas ~= nil then
         buffTrackerCanvas:Show(false)
         buffTrackerCanvas = nil
     end
     BuffWatchWindow.Cleanup()
-    api.SaveSettings()
+    
 end
 
 TargetBuffTrackerAddon.OnLoad = OnLoad
