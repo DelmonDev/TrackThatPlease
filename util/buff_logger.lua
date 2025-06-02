@@ -73,6 +73,7 @@ local function appendNewBuff(buff, unitName, buffTooltip)
         api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%d]|r = |cFFDDA0DD%s|r", tostring(entry.id), tostring(entry.name)))
 
         saveToFile()
+        api:Emit("TTP_NEW_BUFF_LOGGED")
     end
 end 
 
@@ -164,11 +165,13 @@ end
 function BuffsLogger.StartTracking() 
     BuffsLogger.isActive = true
     api.Log:Info("|cFF00FFFF=== Buffs loggers|cFF006600 started|r tracking buffs ===|r")
+    api:Emit("TTP_BUFFS_LOGGING_STARTED")
 end
 
 function BuffsLogger.StopTracking() 
     BuffsLogger.isActive = false
     api.Log:Info("|cFF00FFFF=== Buffs|cFFAA0000 stopped|r tracking buffs ===|r")
+    api:Emit("TTP_BUFFS_LOGGING_STOPPED")
 end
 
 function BuffsLogger.GetBuffsSetCopy()

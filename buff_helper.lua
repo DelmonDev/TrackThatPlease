@@ -53,7 +53,7 @@ function BuffHelper.InitializeAllBuffs(buffsLogger)
             end
             
             -- Override iconPath if logger has it
-            if loggerBuff.path and loggerBuff.path ~= "" then
+            if loggerBuff.iconPath and loggerBuff.iconPath ~= "" then
                 iconPath = loggerBuff.iconPath
             end
             
@@ -72,6 +72,24 @@ function BuffHelper.InitializeAllBuffs(buffsLogger)
         
         table.insert(filteredBuffsArr, entry)
         idIndex[id] = entry
+    end
+
+    -- Second pass: add buffs from buffsFromLogger that are not already in idIndex
+    if buffsFromLogger then
+        for idFromLogger, loggerBuff in pairs(buffsFromLogger) do
+            if not idIndex[idFromLogger] then -- Check if this ID was not in ALL_BUFFS
+                local iconPath = loggerBuff.iconPath
+
+                local entry = {
+                    id = idFromLogger,
+                    name = loggerBuff.name, 
+                    iconPath = loggerBuff.iconPath,
+                    description = loggerBuff.description 
+                }
+                table.insert(filteredBuffsArr, entry)
+                idIndex[idFromLogger] = entry
+            end
+        end
     end
 
     table.sort(filteredBuffsArr, function(a, b)

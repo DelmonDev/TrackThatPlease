@@ -3,12 +3,14 @@ local BuffSettingsWindow = require("TrackThatPlease/buff_settings_wnd")
 local helpers = require("TrackThatPlease/util/helpers")
 local BuffsLogger = require("TrackThatPlease/util/buff_logger")
 local BuffList = require("TrackThatPlease/buff_helper")
+local stopReccordingIconPath = "../Addon/TrackThatPlease/icons/rec-button.png"
+local openSettingsBtnStopIcon
 
 -- Addon Information
 local TargetBuffTrackerAddon = {
     name = "TrackThatPlease",
     author = "Dehling/Fortuno",
-    version = "2.1",
+    version = "2.2",
     desc = "Tracks buffs/debuffs on target, with UI"
 }
 
@@ -142,6 +144,47 @@ local function CreateBuffElement(index, canvas)
     icon:SetExtent(BuffSettingsWindow.settings.iconSize, BuffSettingsWindow.settings.iconSize)
     icon:Show(false)
 
+    -- Create a border around the icon
+    local borderSize = 1
+    
+    -- Top border
+    local topBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
+    topBorder:AddAnchor("TOPLEFT", icon, -borderSize, -borderSize)
+    topBorder:AddAnchor("TOPRIGHT", icon, borderSize, -borderSize)
+    topBorder:SetHeight(borderSize)
+    icon.topBorder = topBorder
+    
+    -- Bottom border
+    local bottomBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
+    bottomBorder:AddAnchor("BOTTOMLEFT", icon, -borderSize, borderSize)
+    bottomBorder:AddAnchor("BOTTOMRIGHT", icon, borderSize, borderSize)
+    bottomBorder:SetHeight(borderSize)
+    icon.bottomBorder = bottomBorder
+    
+    -- Left border
+    local leftBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
+    leftBorder:AddAnchor("TOPLEFT", icon, -borderSize, -borderSize)
+    leftBorder:AddAnchor("BOTTOMLEFT", icon, -borderSize, borderSize)
+    leftBorder:SetWidth(borderSize)
+    icon.leftBorder = leftBorder
+    
+    -- Right border
+    local rightBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
+    rightBorder:AddAnchor("TOPRIGHT", icon, borderSize, -borderSize)
+    rightBorder:AddAnchor("BOTTOMRIGHT", icon, borderSize, borderSize)
+    rightBorder:SetWidth(borderSize)
+    icon.rightBorder = rightBorder
+
+    function icon:SetBorderColor(color)
+        self.topBorder:SetColor(unpack(color))
+        self.bottomBorder:SetColor(unpack(color))
+        self.leftBorder:SetColor(unpack(color))
+        self.rightBorder:SetColor(unpack(color))
+    end
+
+    ----------------------------------------------------------------
+
+    -- Create time label -------------------------------------
     local timeLabel
     timeLabel = canvas:CreateChildWidget("label", "buffTimeLeftLabel" .. index, 0, true)
     timeLabel:SetText("")
@@ -287,11 +330,14 @@ local function UpdateBuffIconsAndTimers(buffs, icons, timeLabels, stackLabels, m
         local stackLabel = stackLabels[i]
 
         F_SLOT.SetIconBackGround(icon, buff.path)
-        --F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
+        
+
         if buff.isBuff then
             F_SLOT.ApplySlotSkin(icon, icon.back, BUFF)
+            icon:SetBorderColor({0, 1, 0, 0.6}) 
         else
             F_SLOT.ApplySlotSkin(icon, icon.back, DEBUFF)
+            icon:SetBorderColor({1, 0, 0, 0.6})
         end
 
         icon:Show(true)
@@ -345,7 +391,7 @@ local function UpdateBuffIconsAndTimers(buffs, icons, timeLabels, stackLabels, m
             )
 
             if shouldBlink then
-                local alpha = GetBlinkAlpha(0.5, 1, blinkTimer)
+                local alpha = GetBlinkAlpha(0.45, 1, blinkTimer)
                 icon:SetAlpha(alpha)
                 timeLabel:SetAlpha(alpha)
                 stackLabel:SetAlpha(alpha)
@@ -435,6 +481,48 @@ local function UpdateBlinkTimer(playerBuffs, targetBuffs, dt)
     end
 end
 
+local recordingIconAnimation = {
+    isActive = false,
+    currentAlpha = 1.0,
+    targetAlpha = 0.1,
+    direction = -1,
+    animationSpeed = 0.08,
+    stepDelay = 100
+}
+
+-- Function to show recording animation
+local function AnimateRecordingIcon()
+    if not recordingIconAnimation.isActive then
+        return
+    end
+    
+    if not openSettingsBtn or not openSettingsBtn.recordingIndicationIcon then
+        recordingIconAnimation.isActive = false
+        return
+    end
+    
+    -- Update current alpha
+    recordingIconAnimation.currentAlpha = recordingIconAnimation.currentAlpha + 
+        (recordingIconAnimation.animationSpeed * recordingIconAnimation.direction)
+    
+    -- Перевірити межі та змінити напрямок
+    if recordingIconAnimation.currentAlpha <= 0.1 then
+        recordingIconAnimation.currentAlpha = 0.1
+        recordingIconAnimation.direction = 1 -- Start increasing
+    elseif recordingIconAnimation.currentAlpha >= 1.0 then
+        recordingIconAnimation.currentAlpha = 1.0
+        recordingIconAnimation.direction = -1 -- Start decreasing
+    end
+    
+    -- Aplly alpha
+    openSettingsBtn.recordingIndicationIcon:SetColor(1, 1, 1, recordingIconAnimation.currentAlpha)
+    
+    -- Plann next animation
+    if recordingIconAnimation.isActive then
+        api:DoIn(recordingIconAnimation.stepDelay, AnimateRecordingIcon)
+    end
+end
+
 -- Update event to handle buff/debuff updates
 local function OnUpdate(dt)
     -- If active will track buffs
@@ -493,6 +581,25 @@ local function HandleChatCommand(channel, unit, isHostile, name, message, speake
     end
 end
 
+local function OnNewBuffLogged()
+    BuffSettingsWindow.RefreshLoggedBuffs()
+end
+local function OnBuffsLoggingStarted()
+    if not recordingIconAnimation.isActive then
+        openSettingsBtn.recordingIndicationIcon:SetVisible(true)
+        recordingIconAnimation.isActive = true
+        recordingIconAnimation.currentAlpha = 1.0
+        recordingIconAnimation.direction = -1
+        AnimateRecordingIcon()
+    end
+end
+local function OnBuffsLoggingStopped()
+    recordingIconAnimation.isActive = false
+    openSettingsBtn.recordingIndicationIcon:SetVisible(false)
+    if openSettingsBtn and openSettingsBtn.recordingIndicationIcon then
+        openSettingsBtn.recordingIndicationIcon:SetColor(1, 1, 1, 1.0)
+    end
+end
 
 -- Load function to initialize the UI elements
 local function OnLoad()
@@ -521,6 +628,9 @@ local function OnLoad()
     
     api.On("UPDATE", OnUpdate)
     api.On("CHAT_MESSAGE", HandleChatCommand)
+    api.On("TTP_NEW_BUFF_LOGGED", OnNewBuffLogged)
+    api.On("TTP_BUFFS_LOGGING_STARTED", OnBuffsLoggingStarted)
+    api.On("TTP_BUFFS_LOGGING_STOPPED", OnBuffsLoggingStopped)
 
     -- Toggle settings window visibility
     openSettingsBtn = helpers.createOverlayButton("TrackThatPls", BuffSettingsWindow.settings.btnSettingsPos,
@@ -533,7 +643,19 @@ local function OnLoad()
     openSettingsBtn:SetHandler("OnClick", function()
         BuffSettingsWindow.ToggleBuffSelectionWindow()
     end)
-
+    -- Create icon for button
+    local _w, buttonHeight = openSettingsBtn:GetExtent()
+    buttonHeight = math.floor(buttonHeight * 0.70)
+    local settingsIconDrawable = openSettingsBtn:CreateImageDrawable("Textures/Defaults/White.dds", "overlay")
+    settingsIconDrawable:SetExtent(buttonHeight, buttonHeight)
+    settingsIconDrawable:AddAnchor("RIGHT", openSettingsBtn, "LEFT", -3, 0)
+    settingsIconDrawable:SetSRGB(false)
+    settingsIconDrawable:SetVisible(false)
+    settingsIconDrawable:SetTgaTexture(stopReccordingIconPath)
+    openSettingsBtn.recordingIndicationIcon = settingsIconDrawable
+    
+    
+    BuffSettingsWindow.RefreshLoggedBuffs()
 
     api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to access the TrackList \n or use the Button from UI")
 end

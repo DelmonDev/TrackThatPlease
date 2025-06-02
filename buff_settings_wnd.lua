@@ -554,6 +554,45 @@ function BuffSettingsWindow.IsWindowVisible()
     return buffSelectionWindow and buffSelectionWindow:IsVisible() or false
 end
 
+function BuffSettingsWindow.RefreshLoggedBuffs()
+    local buffsFromLogger = BuffsLogger.GetBuffsSetCopy()
+
+    if buffsFromLogger then
+        for idFromLogger, loggerBuff in pairs(buffsFromLogger) do
+            if not BuffList.AllBuffsIndex[idFromLogger] then
+                local iconPath = loggerBuff.iconPath
+
+                local entry = {
+                    id = idFromLogger,
+                    name = loggerBuff.name, 
+                    iconPath = loggerBuff.iconPath,
+                    description = loggerBuff.description 
+                }
+                table.insert(BuffList.AllBuffs, entry)
+                BuffList.AllBuffsIndex[idFromLogger] = entry
+
+
+
+                -----
+                local descriptionText
+                if loggerBuff.description and string.len(loggerBuff.description) > 0 then
+                    if string.len(loggerBuff.description) > 100 then
+                        descriptionText = string.sub(loggerBuff.description, 1, 100) .. "..."
+                    else
+                        descriptionText = loggerBuff.description
+                    end
+                else
+                    descriptionText = "No description"
+                end
+                api.Log:Err(string.format("Added new buff from logger: %s (Descr: %s)", loggerBuff.name, descriptionText))
+            end
+        end
+    end
+
+    -- Refill the scroll list with updated data
+    fillBuffData(buffScrollList, buffScrollList.curPageIdx or 1, searchEditBox:GetText())
+end
+
 -- Initialize the BuffWatchWindow
 function BuffSettingsWindow.Initialize(buffsLogger)
     -- Initializers
@@ -902,14 +941,6 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         nil,        -- minValue
         nil,        -- maxValue
         function(value, text)
-            if text ~= "" then
-                if currentCategory == CATEGORY_TYPE_WATCHED then
-                    -- If searching in "Watched Buffs", switch to "All Buffs" category
-                    currentCategory = CATEGORY_TYPE_ALL
-                end
-                categoryDropdown:Select(currentCategory)
-                categoryDropdown:UpdateTextColor(currentCategory)
-            end
             fillBuffData(buffScrollList, 1, text)
         end
     )
@@ -946,12 +977,12 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             end
         end
 
-        --  "Watched Buffs" switch to  "All Buffs"
+--[[         --  "Watched Buffs" switch to  "All Buffs"
         if currentCategory == CATEGORY_TYPE_WATCHED and allSelected then
             currentCategory = CATEGORY_TYPE_ALL
             categoryDropdown:Select(currentCategory)
             categoryDropdown:UpdateTextColor(currentCategory)
-        end
+        end ]]
         
         fillBuffData(buffScrollList, 1, searchEditBox:GetText())
         
@@ -991,12 +1022,10 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     recordAllButton:SetText("Start logging")
     recordAllButton:AddAnchor("TOPLEFT", buffSelectionWindow, "TOPLEFT", 35, 10)
     ApplyButtonSkin(recordAllButton, BUTTON_BASIC.DEFAULT)
-    recordAllButton:SetExtent(90, 26)
-    recordAllButton.style:SetFontSize(13)
-    recordAllButton:SetTextColor(unpack(FONT_COLOR.DEFAULT))
-    recordAllButton:SetHighlightTextColor(unpack(FONT_COLOR.DEFAULT))
-    recordAllButton:SetPushedTextColor(unpack(FONT_COLOR.DEFAULT))
-    recordAllButton:SetDisabledTextColor(unpack(FONT_COLOR.DEFAULT))
+    recordAllButton:SetAutoResize(false)
+    recordAllButton:SetExtent(90, 28)
+    recordAllButton.style:SetFontSize(14)
+
     helpers.createTooltip(
         "recordAllButtonTooltip",
         recordAllButton,
@@ -1005,14 +1034,24 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         "You could find them under the 'All logged buffs' section of 'Buff category'"
     )
 
+    function recordAllButton:UpdateTextColor(color)
+        local color = color or FONT_COLOR.DEFAULT
+        
+        self:SetTextColor(unpack(color))
+        self:SetHighlightTextColor(unpack(color))
+        self:SetPushedTextColor(unpack(color))
+        self:SetDisabledTextColor(unpack(color))
+    end
     function recordAllButton:OnClick()
         if BuffsLogger then
           if BuffsLogger.isActive then
             BuffsLogger.StopTracking()
             recordAllButton:SetText("Start logging")
+            self:UpdateTextColor(FONT_COLOR.DEFAULT)
           else
             BuffsLogger.StartTracking()
             recordAllButton:SetText("Stop logging")
+            self:UpdateTextColor(FONT_COLOR.RED)
           end
         end
     end
