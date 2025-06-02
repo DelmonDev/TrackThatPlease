@@ -1,39 +1,40 @@
 local api = require("api")
-local BuffWatchWindow = require("TrackThatPlease/buffwatchwindow")
+local BuffSettingsWindow = require("TrackThatPlease/buff_settings_wnd")
+local helpers = require("TrackThatPlease/util/helpers")
+local BuffsLogger = require("TrackThatPlease/util/buff_logger")
+local BuffList = require("TrackThatPlease/buff_helper")
 
 -- Addon Information
 local TargetBuffTrackerAddon = {
     name = "TrackThatPlease",
-    author = "Dehling",
-    version = "1.0",
+    author = "Dehling/Fortuno",
+    version = "2.1",
     desc = "Tracks buffs/debuffs on target, with UI"
 }
 
 --FORK Option by @Fortuno for colored buff debuff borders
 --FORK Idea by @mykeew to implement targeting for Target and Self (Player), now properly implemented
---
+
 -- UI Elements
 local playerBuffCanvas
 local targetBuffCanvas
-local MAX_BUFFS_SHOWN = 5
 local playerBuffIcons = {}
 local playerBuffLabels = {}
 local targetBuffIcons = {}
 local targetBuffLabels = {}
+local playerBuffStackLabels = {}
+local targetBuffStackLabels = {}
+local openSettingsBtn
 
 -- Variables
-local previousXYZ = "0,0,0"
+local previousPlayerXYZString = "0,0,0"
+local previousPlayerXYZSmothed = {x = 0, y = 0, z = 0}
+local previousTargetXYZString = "0,0,0"
+local previousTargetXYZSmothed = {x = 0, y = 0, z = 0}
 local previousTarget
+local uiScale
+local isRefreshingUIForNewSettings = false
 
--- THIS RIGHT HERE ARE THE SETTINGS, 
-local settings = {
-    ShowTimers = true,
-    IconSize = 25,
-    IconSpacing = 3,
-    UISize = 100, -- 80, 90 ,100, 110, 120
-    RecolorIconBorders = true,  -- New setting for toggling icon border recoloring
-    TargetBuffVerticalOffset = -35  -- New setting for target buff vertical offset
-}
 
 --ICON BACKGROUNDS IF BUFF OR DEBUFF
 --------------------------------------------------------------------------------------------------------------------------------------------
@@ -81,46 +82,121 @@ DEBUFF = {
     }
 }
 --------------------------------------------------------------------------------------------------------------------------------------------
+-- smoothing function to prevent player buffs jittering
+-- Frame-rate independent smoothing function to prevent player buffs jittering
+local function SmoothPosition(current, last, deltaTime, unitType)
+    local smoothingSpeed = BuffSettingsWindow.settings.smoothingSpeed
+
+    if unitType == "target" then
+        return {
+            x = current.x,
+            y = current.y,
+            z = current.z
+        }
+    end
+
+    if smoothingSpeed == 0 then
+        return {
+            x = math.floor(current.x * 100 + 0.5) / 100,
+            y = math.floor(current.y * 100 + 0.5) / 100,
+            z = current.z
+        }
+    end
+
+    -- Calculate the smoothing factor (frame-rate independent)
+    local smoothingFactor = 1 - math.exp(-smoothingSpeed * (deltaTime / 1000))
+    smoothingFactor = math.max(0, math.min(1, smoothingFactor))
+    
+    local smoothedX = last.x + (current.x - last.x) * smoothingFactor
+    local smoothedY = last.y + (current.y - last.y) * smoothingFactor
+    
+    return {
+        x = math.floor(smoothedX * 100 + 0.5) / 100,
+        y = math.floor(smoothedY * 100 + 0.5) / 100,
+        z = current.z
+    }
+end
+
+local buffBlinkSpeed = 5 -- Speed of the blink effect
+local function GetBlinkAlpha(minAlpha, maxAlpha, timer)
+    local amplitude = (maxAlpha - minAlpha) / 2
+    local mid = (maxAlpha + minAlpha) / 2
+    return mid + amplitude * math.sin(timer * buffBlinkSpeed)
+end
+
 -- Function to check if a buff is being watched for player or target
 local function IsWatchedBuff(buffId, isPlayer)
     buffId = math.floor(tonumber(buffId) or 0)
     if isPlayer then
-        return BuffWatchWindow.IsPlayerBuffWatched(buffId)
+        return BuffSettingsWindow.IsPlayerBuffWatched(buffId)
     else
-        return BuffWatchWindow.IsTargetBuffWatched(buffId)
+        return BuffSettingsWindow.IsTargetBuffWatched(buffId)
     end
 end
 
 -- Function to create buff icon and label
 local function CreateBuffElement(index, canvas)
     local icon = CreateItemIconButton("buffIcon" .. index, canvas)
-    icon:Clickable(false)
-    icon:SetExtent(settings.IconSize, settings.IconSize)
-    icon:Show(false)
     F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
+    icon:Clickable(false)
+    icon:SetExtent(BuffSettingsWindow.settings.iconSize, BuffSettingsWindow.settings.iconSize)
+    icon:Show(false)
 
-    local label
-    if settings.ShowTimers then
-        label = canvas:CreateChildWidget("label", "buffTimeLeftLabel" .. index, 0, true)
-        label:SetText("")
-        label:AddAnchor("CENTER", icon, "CENTER", 0, 0)
-        label.style:SetFontSize(12)
-        label.style:SetAlign(ALIGN.CENTER)
-        label.style:SetShadow(true)
-        label:Show(false)
-    end
+    local timeLabel
+    timeLabel = canvas:CreateChildWidget("label", "buffTimeLeftLabel" .. index, 0, true)
+    timeLabel:SetText("")
+    timeLabel:AddAnchor("CENTER", icon, "CENTER", 0, 0)
+    timeLabel.style:SetFontSize(BuffSettingsWindow.settings.fontSize)
+    --timeLabel.style:SetFont("ui/font/yoon_firedgothic_b.ttf", BuffSettingsWindow.settings.fontSize)
+    timeLabel.style:SetAlign(ALIGN.CENTER)
+    timeLabel.style:SetShadow(true)
+    timeLabel.style:SetOutline(true)
+    timeLabel:Show(false)
+    timeLabel.style:SetColor(1, 1, 1, 1)
 
-    return icon, label
+    local stackLabel = canvas:CreateChildWidget("label", "buffStackLabel" .. index, 0, true)
+    local stackFontSize = math.floor(BuffSettingsWindow.settings.fontSize * 0.65 + 0.5)
+    stackLabel:SetText("")
+    stackLabel:AddAnchor("TOPLEFT", icon, "TOPLEFT", 2, 6)
+    -- ui/font/SD_LeeyagiL.ttf
+    -- ui/font/yoon_firedgothic_b.ttf
+    --stackLabel.style:SetFont("ui/font/yoon_firedgothic_b.ttf", BuffSettingsWindow.settings.fontSize - 4) -- another font for stacks
+    stackLabel.style:SetFontSize(stackFontSize)
+    stackLabel.style:SetAlign(ALIGN.LEFT)
+    stackLabel.style:SetShadow(true)
+    stackLabel.style:SetOutline(true)
+    stackLabel.style:SetColor(0.97, 0.91, 0.81, 0.9)
+    stackLabel:SetAlpha(0.80) 
+
+    stackLabel:Show(false)
+
+    return icon, timeLabel, stackLabel
 end
 
 -- Function to position buffs with whole bar centered
-local function PositionBuffs(watchedBuffs, canvas, icons, labels)
-    local totalWidth = #watchedBuffs * settings.IconSize + (#watchedBuffs - 1) * settings.IconSpacing
-    local startX = -totalWidth / 2 + settings.IconSize / 2
+local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels)
+    local maxBuffsToDisplay = math.min(#watchedBuffs, BuffSettingsWindow.settings.maxBuffsShown)
+    local iconSize = BuffSettingsWindow.settings.iconSize
+    local iconSpacing = BuffSettingsWindow.settings.iconSpacing
+    local fontSize = BuffSettingsWindow.settings.fontSize
     
-    for i = 1, #watchedBuffs do
+    local newWidth = iconSize * maxBuffsToDisplay + (maxBuffsToDisplay - 1) * iconSpacing
+    local newHeight = iconSize
+
+    -- Update the canvas size
+    canvas:SetExtent(newWidth, newHeight)
+
+    local startX = -newWidth / 2 + iconSize / 2
+    
+    for i = 1, maxBuffsToDisplay do
         local icon = icons[i]
-        local offsetX = startX + (i - 1) * (settings.IconSize + settings.IconSpacing)
+        local offsetX = startX + (i - 1) * (iconSize + iconSpacing)
+        local label = labels[i]
+        local stackLabel = stackLabels[i]
+
+        label.style:SetFontSize(fontSize)
+        stackLabel.style:SetFontSize(fontSize - 3) -- Update stack label font size
+        icon:SetExtent(iconSize, iconSize)
         icon:RemoveAllAnchors()
         icon:AddAnchor("CENTER", canvas, "CENTER", offsetX, 0)
     end
@@ -135,7 +211,7 @@ local function GetPositionAdjustment()
         [110] = { x = 0, y = 3 },
         [120] = { x = 0, y = 6 },
     }
-    return adjustments[settings.UISize] or { x = 0, y = 0 }
+    return adjustments[uiScale] or { x = 0, y = 0 }
 end
 
 -- Function to collect all watched buffs and debuffs
@@ -177,12 +253,15 @@ end
 
 -- Function to clear all buff icons and labels
 local function ClearAllBuffs()
-    for i = 1, MAX_BUFFS_SHOWN do
+    for i = 1, BuffSettingsWindow.MAX_BUFFS_COUNT do
         if playerBuffIcons[i] then
             playerBuffIcons[i]:Show(false)
         end
         if playerBuffLabels[i] then
             playerBuffLabels[i]:Show(false)
+        end
+        if playerBuffStackLabels[i] then
+            playerBuffStackLabels[i]:Show(false)
         end
         if targetBuffIcons[i] then
             targetBuffIcons[i]:Show(false)
@@ -190,183 +269,306 @@ local function ClearAllBuffs()
         if targetBuffLabels[i] then
             targetBuffLabels[i]:Show(false)
         end
+        if targetBuffStackLabels[i] then
+            targetBuffStackLabels[i]:Show(false)
+        end
+    end
+end
+
+local loggedBuffIds = {}
+
+local function UpdateBuffIconsAndTimers(buffs, icons, timeLabels, stackLabels, maxBuffsToDisplay, blinkTimer)
+    local shoudShowStacks = BuffSettingsWindow.settings.shouldShowStacks
+
+    for i = 1, maxBuffsToDisplay do
+        local buff = buffs[i]
+        local icon = icons[i]
+        local timeLabel = timeLabels[i]
+        local stackLabel = stackLabels[i]
+
+        F_SLOT.SetIconBackGround(icon, buff.path)
+        --F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
+        if buff.isBuff then
+            F_SLOT.ApplySlotSkin(icon, icon.back, BUFF)
+        else
+            F_SLOT.ApplySlotSkin(icon, icon.back, DEBUFF)
+        end
+
+        icon:Show(true)
+        -- Buff indication logic
+        if buff.timeLeft and buff.timeLeft > 0 then
+            -- Timers ----------------------------------------------------------------
+            local timerText = ""
+            local warnTime = (buff.isBuff and BuffSettingsWindow.settings.buffWarnTime) 
+                or (not buff.isBuff and BuffSettingsWindow.settings.debuffWarnTime)
+
+            if buff.timeLeft > 5940000 then -- More than 99 minutes (99 * 60 * 1000 ms)
+                timerText = string.format("%dh", math.floor(buff.timeLeft / 3600000)) -- Convert to hours
+            elseif buff.timeLeft > 60000 then -- More than 1 minute but less than 99 minutes
+                timerText = string.format("%dm", math.floor(buff.timeLeft / 60000))
+            elseif buff.timeLeft >= warnTime then
+                timerText = string.format("%ds", math.floor(buff.timeLeft / 1000))
+            else -- Less than warnTime
+                timerText = string.format("%.1f", buff.timeLeft / 1000)
+            end
+            timeLabel:SetText(timerText)
+            timeLabel:Show(true)
+
+            -- Stacks -------------------------------------------------------------------------------
+            -- shoudShowStacks
+            if shoudShowStacks and buff.stack and buff.stack > 1 then
+                -- Format stack number
+                local stackText
+                local thousands
+                if buff.stack >= 1000 then
+                    thousands = buff.stack / 1000
+                    if thousands == math.floor(thousands) then
+                        stackText = string.format("%dk", thousands)
+                    else
+                        stackText = string.format("%.1fk", thousands)
+                    end
+                else
+                    stackText = tostring(buff.stack)
+                end
+                
+                --stackLabel:SetText("x" .. (buff.stack >= 1000 and " " or "") .. stackText)
+                stackLabel:SetText("x" .. stackText)
+                stackLabel:Show(true)
+            else
+                stackLabel:Show(false)
+            end
+
+            -- Blink effect -----------------------------------------------------------------
+            local shouldBlink = (
+                (buff.isBuff and buff.timeLeft <= BuffSettingsWindow.settings.buffWarnTime) or
+                (not buff.isBuff and buff.timeLeft <= BuffSettingsWindow.settings.debuffWarnTime)
+            )
+
+            if shouldBlink then
+                local alpha = GetBlinkAlpha(0.5, 1, blinkTimer)
+                icon:SetAlpha(alpha)
+                timeLabel:SetAlpha(alpha)
+                stackLabel:SetAlpha(alpha)
+            else
+                timeLabel:SetAlpha(1)
+                icon:SetAlpha(1)
+                stackLabel:SetAlpha(1)
+            end
+        else
+            timeLabel:SetText("")
+            timeLabel:Show(false)
+            stackLabel:SetText("")
+            stackLabel:Show(false)
+        end
+    end
+end
+
+local function HideUnusedBuffSlots(buffIcons, buffLabels, stackLabels, maxBuffsToDisplay)
+    -- Hide unused buff slots
+    for i = maxBuffsToDisplay + 1, BuffSettingsWindow.MAX_BUFFS_COUNT do
+        buffIcons[i]:Show(false)
+        if buffLabels[i] then buffLabels[i]:Show(false) end
+        if stackLabels[i] then stackLabels[i]:Show(false) end
+    end
+end
+
+local function UpdateBuffsPositionWithSmoothing(unitType, dt)
+    local x, y, z = api.Unit:GetUnitScreenPosition(unitType)
+    
+    if x and y and z then
+        local currentPos = {x = x, y = y, z = z}
+        
+        local previousXYZSmoothed, previousXYZString, canvas, baseOffsetY
+        
+        if unitType == "player" then
+            previousXYZSmoothed = previousPlayerXYZSmothed
+            previousXYZString = previousPlayerXYZString
+            canvas = playerBuffCanvas
+            baseOffsetY = BuffSettingsWindow.settings.playerBuffVerticalOffset
+        else -- target
+            previousXYZSmoothed = previousTargetXYZSmothed
+            previousXYZString = previousTargetXYZString
+            canvas = targetBuffCanvas
+            baseOffsetY = BuffSettingsWindow.settings.targetBuffVerticalOffset
+        end
+        
+        local smoothPos = SmoothPosition(currentPos, previousXYZSmoothed, dt, unitType)
+        
+        local smoothedPosString = string.format("%.3f,%.3f,%.3f", smoothPos.x, smoothPos.y, smoothPos.z)
+        if previousXYZString ~= smoothedPosString then
+            local adjustment = GetPositionAdjustment()
+            
+            canvas:RemoveAllAnchors()
+            canvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", 
+                smoothPos.x + adjustment.x, 
+                smoothPos.y + baseOffsetY + adjustment.y)
+            
+            if unitType == "player" then
+                previousPlayerXYZString = smoothedPosString
+            else -- target
+                previousTargetXYZString = smoothedPosString
+            end
+        end
+        
+        previousXYZSmoothed.x = smoothPos.x
+        previousXYZSmoothed.y = smoothPos.y
+        previousXYZSmoothed.z = smoothPos.z
+        
+        canvas:Show(previousXYZSmoothed.z >= 0 and previousXYZSmoothed.z <= 100)
+    end
+end
+
+
+local blinkTimer = 0
+local BLINK_CYCLE = math.pi * 2 -- Full cycle for sin()
+
+--- Function to update the blink timer based on player and target buffs
+local function UpdateBlinkTimer(playerBuffs, targetBuffs, dt)
+    if #playerBuffs > 0 or #targetBuffs > 0 then
+        blinkTimer = blinkTimer + dt / 1000
+        
+        if blinkTimer >= BLINK_CYCLE then
+            blinkTimer = blinkTimer - BLINK_CYCLE
+        end
+    else
+        blinkTimer = 0 
     end
 end
 
 -- Update event to handle buff/debuff updates
-local function OnUpdate()
-    -- Clear all buffs before updating
-    ClearAllBuffs()
+local function OnUpdate(dt)
+    -- If active will track buffs
+    BuffsLogger.Track(dt)
 
-    -- [NEW CODE START] Check if player is targeting themselves
+
+    -- Check if player is targeting themselves
     local playerUnitId = api.Unit:GetUnitId("player")
     local targetUnitId = api.Unit:GetUnitId("target")
     local isSelfTarget = (playerUnitId == targetUnitId)
-    -- [NEW CODE END]
 
     -- Collect all watched buffs and debuffs
     local playerBuffs, targetBuffs = CollectWatchedBuffsAndDebuffs()
+    -- Update blink timer
+    UpdateBlinkTimer(playerBuffs, targetBuffs, dt)
 
-    -- Update position and show player buffs/debuffs
+    -- ## PLAYER Update position and show player buffs/debuffs ##------
     if #playerBuffs > 0 then
-        PositionBuffs(playerBuffs, playerBuffCanvas, playerBuffIcons, playerBuffLabels)
+        local maxPlayerBuffsToDisplay = math.min(#playerBuffs, BuffSettingsWindow.settings.maxBuffsShown)
 
-        for i = 1, math.min(#playerBuffs, MAX_BUFFS_SHOWN) do
-            local buff = playerBuffs[i]
-            local icon = playerBuffIcons[i]
-            local label = playerBuffLabels[i]
-
-            F_SLOT.SetIconBackGround(icon, buff.path)
-            if settings.RecolorIconBorders then
-                if buff.isBuff then
-                    F_SLOT.ApplySlotSkin(icon, icon.back, BUFF)
-                else
-                    F_SLOT.ApplySlotSkin(icon, icon.back, DEBUFF)
-                end
-            else
-                F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
-            end
-            icon:Show(true)
-            
-            if settings.ShowTimers and label then
-                if buff.timeLeft and buff.timeLeft > 0 then
-                    label:SetText(string.format("%.1f", (buff.timeLeft / 1000)))
-                else
-                    label:SetText("")
-                end
-                label:Show(true)
-            end
-        end
-
-        -- Hide unused buff slots
-        for i = #playerBuffs + 1, MAX_BUFFS_SHOWN do
-            playerBuffIcons[i]:Show(false)
-            if playerBuffLabels[i] then playerBuffLabels[i]:Show(false) end
-        end
-
-        -- Update canvas position with UI scale adjustment
-        local x, y, z = api.Unit:GetUnitScreenPosition("player")
-        if previousXYZ ~= (x .. "," .. y .. "," .. z) then
-            local adjustment = GetPositionAdjustment()
-            local baseOffsetY = -35  -- Base vertical offset
-            playerBuffCanvas:RemoveAllAnchors()
-            playerBuffCanvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", x + adjustment.x, y + baseOffsetY + adjustment.y)
-            previousXYZ = x .. "," .. y .. "," .. z
-        end
-
-        playerBuffCanvas:Show(z >= 0 and z <= 100)
+        PositionBuffs(playerBuffs, playerBuffCanvas, playerBuffIcons, playerBuffLabels, playerBuffStackLabels)
+        UpdateBuffIconsAndTimers(playerBuffs, playerBuffIcons, playerBuffLabels, playerBuffStackLabels, maxPlayerBuffsToDisplay, blinkTimer)
+        HideUnusedBuffSlots(playerBuffIcons, playerBuffLabels, playerBuffStackLabels, maxPlayerBuffsToDisplay)
+        UpdateBuffsPositionWithSmoothing("player", dt)
     else
+        -- Hide last icon and label if no player buffs
+        if playerBuffIcons[1]:Show(false) then playerBuffIcons[1]:Show(false) end
+        if playerBuffLabels[1] then playerBuffLabels[1]:Show(false) end
+        if playerBuffStackLabels[1] then playerBuffStackLabels[1]:Show(false) end
         playerBuffCanvas:Show(false)
     end
+    -- ##--------------------------------------------------------------------------------- ## -----
 
-    -- [MODIFIED CODE START] Update position and show target buffs/debuffs (only if not self-targeting)
+    -- ## TARGET Update position and show target buffs/debuffs (only if not self-targeting) ##------
     if not isSelfTarget and #targetBuffs > 0 then
-    -- [MODIFIED CODE END]
-        PositionBuffs(targetBuffs, targetBuffCanvas, targetBuffIcons, targetBuffLabels)
+        local maxTargetBuffsToDisplay = math.min(#targetBuffs, BuffSettingsWindow.settings.maxBuffsShown)
 
-        for i = 1, math.min(#targetBuffs, MAX_BUFFS_SHOWN) do
-            local buff = targetBuffs[i]
-            local icon = targetBuffIcons[i]
-            local label = targetBuffLabels[i]
-
-            F_SLOT.SetIconBackGround(icon, buff.path)
-            if settings.RecolorIconBorders then
-                if buff.isBuff then
-                    F_SLOT.ApplySlotSkin(icon, icon.back, BUFF)
-                else
-                    F_SLOT.ApplySlotSkin(icon, icon.back, DEBUFF)
-                end
-            else
-                F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
-            end
-            icon:Show(true)
-            
-            if settings.ShowTimers and label then
-                if buff.timeLeft and buff.timeLeft > 0 then
-                    label:SetText(string.format("%.1f", (buff.timeLeft / 1000)))
-                else
-                    label:SetText("")
-                end
-                label:Show(true)
-            end
-        end
-
-        -- Hide unused buff slots
-        for i = #targetBuffs + 1, MAX_BUFFS_SHOWN do
-            targetBuffIcons[i]:Show(false)
-            if targetBuffLabels[i] then targetBuffLabels[i]:Show(false) end
-        end
-
-        -- Update canvas position with UI scale adjustment
-        local x, y, z = api.Unit:GetUnitScreenPosition("target")
-        if previousTarget ~= (x .. "," .. y .. "," .. z) then
-            local adjustment = GetPositionAdjustment()
-            local baseOffsetY = settings.TargetBuffVerticalOffset  -- Use the new setting for target buff vertical offset
-            targetBuffCanvas:RemoveAllAnchors()
-            targetBuffCanvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", x + adjustment.x, y + baseOffsetY + adjustment.y)
-            previousTarget = x .. "," .. y .. "," .. z
-        end
-
-        targetBuffCanvas:Show(z >= 0 and z <= 100)
+        PositionBuffs(targetBuffs, targetBuffCanvas, targetBuffIcons, targetBuffLabels, targetBuffStackLabels)
+        UpdateBuffIconsAndTimers(targetBuffs, targetBuffIcons, targetBuffLabels, targetBuffStackLabels, maxTargetBuffsToDisplay, blinkTimer)
+        HideUnusedBuffSlots(targetBuffIcons, targetBuffLabels, targetBuffStackLabels, maxTargetBuffsToDisplay)
+        UpdateBuffsPositionWithSmoothing("target", dt)
     else
+        -- Hide last icon and label if no target buffs
+        if targetBuffIcons[1]:Show(false) then targetBuffIcons[1]:Show(false) end
+        if targetBuffLabels[1] then targetBuffLabels[1]:Show(false) end
+        if targetBuffStackLabels[1] then targetBuffStackLabels[1]:Show(false) end
         targetBuffCanvas:Show(false)
     end
+    -- ##---------------------------------------------------------------------------------
 end
 
 local function HandleChatCommand(channel, unit, isHostile, name, message, speakerInChatBound, specifyName, factionName, trialPosition)
     local playerName = api.Unit:GetUnitNameById(api.Unit:GetUnitId("player"))
     if playerName == name and message == "ttp" then
-        BuffWatchWindow.ToggleBuffSelectionWindow()
+        BuffSettingsWindow.ToggleBuffSelectionWindow()
     end
 end
 
+
 -- Load function to initialize the UI elements
 local function OnLoad()
-    api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to access the TrackList")
-    local savedSettings = api.GetSettings("TrackThatPlease")
-    if savedSettings then
-        for k, v in pairs(savedSettings) do
-            settings[k] = v
-        end
-    end
+    -- load setttings------------------------
+    BuffsLogger.Initialize()
+    BuffSettingsWindow.Initialize(BuffsLogger)
 
-    -- Ensure the new setting has a default value if it wasn't in saved settings
-    if settings.RecolorIconBorders == nil then
-        settings.RecolorIconBorders = true
-    end
+    uiScale = math.floor(BuffSettingsWindow.settings.UIScale * 100 + 0.5)
+    -------------------------------------
 
     playerBuffCanvas = api.Interface:CreateEmptyWindow("playerBuffCanvas")
-    playerBuffCanvas:SetExtent(settings.IconSize * MAX_BUFFS_SHOWN + (MAX_BUFFS_SHOWN - 1) * settings.IconSpacing, settings.IconSize)
+    playerBuffCanvas:SetExtent(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing, BuffSettingsWindow.settings.iconSize)
     playerBuffCanvas:Show(false)
     playerBuffCanvas:Clickable(false)
-
+    
     targetBuffCanvas = api.Interface:CreateEmptyWindow("targetBuffCanvas")
-    targetBuffCanvas:SetExtent(settings.IconSize * MAX_BUFFS_SHOWN + (MAX_BUFFS_SHOWN - 1) * settings.IconSpacing, settings.IconSize)
+    targetBuffCanvas:SetExtent(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing, BuffSettingsWindow.settings.iconSize)
     targetBuffCanvas:Show(false)
     targetBuffCanvas:Clickable(false)
-
-    for i = 1, MAX_BUFFS_SHOWN do
-        playerBuffIcons[i], playerBuffLabels[i] = CreateBuffElement(i, playerBuffCanvas)
-        targetBuffIcons[i], targetBuffLabels[i] = CreateBuffElement(i, targetBuffCanvas)
+    
+    -- Create buff canvases
+    for i = 1, BuffSettingsWindow.MAX_BUFFS_COUNT do
+        playerBuffIcons[i], playerBuffLabels[i], playerBuffStackLabels[i] = CreateBuffElement(i, playerBuffCanvas)
+        targetBuffIcons[i], targetBuffLabels[i], targetBuffStackLabels[i] = CreateBuffElement(i, targetBuffCanvas)
     end
-
+    
     api.On("UPDATE", OnUpdate)
     api.On("CHAT_MESSAGE", HandleChatCommand)
 
-    BuffWatchWindow.Initialize(settings)
+    -- Toggle settings window visibility
+    openSettingsBtn = helpers.createOverlayButton("TrackThatPls", BuffSettingsWindow.settings.btnSettingsPos,
+        function ()
+          local PosX, PosY = openSettingsBtn:GetOffset()
+          BuffSettingsWindow.settings.btnSettingsPos = { PosX, PosY }
+          BuffSettingsWindow.SaveSettings()
+        end
+    )
+    openSettingsBtn:SetHandler("OnClick", function()
+        BuffSettingsWindow.ToggleBuffSelectionWindow()
+    end)
+
+
+    api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to access the TrackList \n or use the Button from UI")
 end
 
 -- Unload function to clean up
 local function OnUnload()
-    -- Clear all buffs before unloading
-    ClearAllBuffs()
+    -- Disconnect event handlers to prevent memory leaks
+    api.On("UPDATE", function() end)
+    api.On("CHAT_MESSAGE", function() end)
 
-    if buffTrackerCanvas ~= nil then
-        buffTrackerCanvas:Show(false)
-        buffTrackerCanvas = nil
+    -- Cleanup BuffWatchWindow first (saves settings)
+    if BuffSettingsWindow and BuffSettingsWindow.Cleanup then
+        BuffSettingsWindow.Cleanup()
+        BuffSettingsWindow = nil
     end
-    BuffWatchWindow.Cleanup()
-    api.SaveSettings()
+
+    -- Clean up settings button
+    if openSettingsBtn then
+        openSettingsBtn:Show(false)
+        openSettingsBtn = nil
+    end
+
+    -- Clean up player buff UI elements
+    if playerBuffCanvas then
+        playerBuffCanvas:Show(false)
+        playerBuffCanvas = nil
+    end
+    
+    -- Clean up target buff UI elements
+    if targetBuffCanvas then
+        targetBuffCanvas:Show(false)
+        targetBuffCanvas = nil
+    end
+
+    api.Log:Err("TrackThatPlease: Unload completed successfully")
 end
 
 TargetBuffTrackerAddon.OnLoad = OnLoad
