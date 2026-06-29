@@ -1,5 +1,6 @@
 local api = require("api")
 local checkButton = require('TrackThatPlease/util/check_button')
+local createSlider = require('TrackThatPlease/util/slider')
 local helpers = {}
 local labelFontSize = 14
 local lableFontColor = FONT_COLOR.DARK_GRAY
@@ -7,6 +8,16 @@ local dropDownFontColor = FONT_COLOR.BLACK
 local dropDownFontSize = 15
 local dropDownWidth = 80
 local dropdownHeight = 28
+local counterWidth = 80
+local counterHeight = 24
+local sliderWidth = 172
+
+local function ApplyButtonTextColor(button, color)
+    button:SetTextColor(unpack(color))
+    button:SetHighlightTextColor(unpack(color))
+    button:SetPushedTextColor(unpack(color))
+    button:SetDisabledTextColor(unpack(color))
+end
 
 -- Create a checkbox with label and optional tooltip
 function helpers.CreateCheckboxWithLabel(parent, anchorInfo, labelText, checkboxText, defaultChecked, onCheckedChanged, tooltipText)
@@ -27,7 +38,7 @@ function helpers.CreateCheckboxWithLabel(parent, anchorInfo, labelText, checkbox
 
     -- Create checkbox below the label using checkButton.CreateCheckButton
     local checkBox = checkButton.CreateCheckButton("checkbox_" .. tostring(math.random(1000, 9999)), parent, checkboxText or "")
-    checkBox:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 13) -- gap below label
+    checkBox:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 10) -- gap below label
     checkBox:SetButtonStyle("default")
     
     -- Set default checked state
@@ -55,6 +66,47 @@ function helpers.CreateCheckboxWithLabel(parent, anchorInfo, labelText, checkbox
     return checkBox, label, tooltip
 end
 
+function helpers.CreateInlineCheckboxWithLabel(parent, anchorInfo, labelText, checkboxText, defaultChecked, onCheckedChanged, tooltipText)
+    local label = parent:CreateChildWidget("label", "label_" .. tostring(math.random(1000, 9999)), 0, true)
+
+    if anchorInfo.anchor then
+        label:AddAnchor(anchorInfo.anchor, anchorInfo.target, anchorInfo.relativeAnchor or anchorInfo.anchor, anchorInfo.x or 0, anchorInfo.y or 0)
+    end
+
+    label:SetText(labelText or "")
+    label.style:SetAlign(ALIGN.LEFT)
+    label.style:SetFontSize(labelFontSize)
+    ApplyTextColor(label, lableFontColor)
+    if label.SetAutoResize ~= nil then
+        label:SetAutoResize(true)
+    end
+
+    local checkBox = checkButton.CreateCheckButton("checkbox_" .. tostring(math.random(1000, 9999)), parent, checkboxText or "")
+    checkBox:AddAnchor("LEFT", label, "RIGHT", 8, 0)
+    checkBox:SetButtonStyle("default")
+
+    if defaultChecked then
+        checkBox:SetChecked(true)
+    end
+
+    if onCheckedChanged then
+        function checkBox:OnCheckChanged()
+            local isChecked = self:GetChecked()
+
+            onCheckedChanged(isChecked)
+        end
+
+        checkBox:SetHandler("OnCheckChanged", checkBox.OnCheckChanged)
+    end
+
+    local tooltip = nil
+    if tooltipText and tooltipText ~= "" then
+        tooltip = helpers.createTooltip("tooltip_" .. tostring(math.random(1000, 9999)), checkBox, tooltipText, 0, 0)
+    end
+
+    return checkBox, label, tooltip
+end
+
 -- Create a dropdown/combobox with label and optional tooltip
 function helpers.CreateDropdownWithLabel(parent, anchorInfo, labelText, width, options, defaultIndex, onSelectionChanged, tooltipText, tooltipYOffset)
     -- Create label first
@@ -73,7 +125,7 @@ function helpers.CreateDropdownWithLabel(parent, anchorInfo, labelText, width, o
     
     -- Create dropdown below the label
     local dropdown = api.Interface:CreateComboBox(parent)
-    dropdown:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 10) -- gap below label
+    dropdown:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 8) -- gap below label
     
     -- Set dropdown properties
     dropdown:SetWidth((width and width ~= 0 and width) or dropDownWidth)
@@ -140,7 +192,7 @@ function helpers.CreateTextEditWithLabel(parent, anchorInfo, labelText, width, h
     
     -- Create text edit below the label
     local textEdit = W_CTRL.CreateEdit("textEdit_" .. tostring(math.random(1000, 9999)), parent)
-    textEdit:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 13) -- gap below label
+    textEdit:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 10) -- gap below label
     
     -- Set text edit properties
     textEdit:SetExtent(width or 80, height or 24)
@@ -191,6 +243,277 @@ function helpers.CreateTextEditWithLabel(parent, anchorInfo, labelText, width, h
     end
     
     return textEdit, label, tooltip
+end
+
+function helpers.CreateSliderWithLabel(parent, anchorInfo, labelText, width, defaultValue, minValue, maxValue, step, onValueChanged, tooltipText, valueScale)
+    local label = parent:CreateChildWidget("label", "label_" .. tostring(math.random(1000, 9999)), 0, true)
+
+    if anchorInfo.anchor then
+        label:AddAnchor(anchorInfo.anchor, anchorInfo.target, anchorInfo.relativeAnchor or anchorInfo.anchor, anchorInfo.x or 0, anchorInfo.y or 0)
+    end
+
+    local totalWidth = (width and width > 0) and width or sliderWidth
+    local valueLabelWidth = 44
+    local labelWidth = math.max(60, totalWidth - valueLabelWidth - 6)
+
+    label:SetText(labelText or "")
+    label:SetExtent(labelWidth, 18)
+    label.style:SetAlign(ALIGN.LEFT)
+    label.style:SetFontSize(labelFontSize)
+    ApplyTextColor(label, lableFontColor)
+
+    local valueLabel = parent:CreateChildWidget("label", "sliderValue_" .. tostring(math.random(1000, 9999)), 0, true)
+    valueLabel:AddAnchor("LEFT", label, "RIGHT", 6, 0)
+    valueLabel:SetExtent(valueLabelWidth, 18)
+    valueLabel.style:SetAlign(ALIGN.RIGHT)
+    valueLabel.style:SetFontSize(labelFontSize)
+    ApplyTextColor(valueLabel, FONT_COLOR.BLACK)
+
+    local sliderStep = tonumber(step) or 1
+
+    local function getStepDecimals(value)
+        local text = tostring(value or "")
+        local dotIndex = string.find(text, ".", 1, true)
+        if not dotIndex then
+            return 0
+        end
+        return string.len(text) - dotIndex
+    end
+
+    local stepDecimals = getStepDecimals(sliderStep)
+    local sliderScale = tonumber(valueScale)
+    if sliderScale == nil or sliderScale < 1 then
+        sliderScale = math.pow(10, stepDecimals)
+    end
+    sliderScale = math.max(1, math.floor(sliderScale + 0.5))
+
+    local function scaleToSlider(value)
+        return math.floor((tonumber(value) or 0) * sliderScale + 0.5)
+    end
+
+    local function scaleFromSlider(value)
+        return (tonumber(value) or 0) / sliderScale
+    end
+
+    local slider = createSlider("slider_" .. tostring(math.random(1000, 9999)), parent)
+    slider:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 8)
+    slider:SetExtent(totalWidth, 26)
+    slider:SetMinMaxValues(scaleToSlider(minValue), scaleToSlider(maxValue))
+    if slider.SetStep ~= nil then
+        slider:SetStep(math.max(1, scaleToSlider(sliderStep)))
+    else
+        slider:SetValueStep(math.max(1, scaleToSlider(sliderStep)))
+    end
+    if slider.UseWheel ~= nil then
+        slider:UseWheel()
+    end
+
+    local function formatValue(value)
+        if stepDecimals <= 0 then
+            return tostring(math.floor(value + 0.5))
+        end
+
+        local formatted = string.format("%." .. tostring(stepDecimals) .. "f", value)
+        formatted = formatted:gsub("(%..-)0+$", "%1")
+        formatted = formatted:gsub("%.$", "")
+        return formatted
+    end
+
+    local function normalizeValue(value)
+        value = tonumber(value) or minValue or 0
+        if minValue ~= nil and value < minValue then
+            value = minValue
+        end
+        if maxValue ~= nil and value > maxValue then
+            value = maxValue
+        end
+
+        local baseValue = tonumber(minValue) or 0
+        local snappedSteps = math.floor(((value - baseValue) / sliderStep) + 0.5)
+        local snappedValue = baseValue + (snappedSteps * sliderStep)
+
+        if minValue ~= nil and snappedValue < minValue then
+            snappedValue = minValue
+        end
+        if maxValue ~= nil and snappedValue > maxValue then
+            snappedValue = maxValue
+        end
+
+        return tonumber(string.format("%.6f", snappedValue)) or snappedValue
+    end
+
+    local isInternalSliderUpdate = false
+
+    local function setSliderValue(value, shouldNotify)
+        value = normalizeValue(value)
+        valueLabel:SetText(formatValue(value))
+        isInternalSliderUpdate = true
+        if slider.SetValue ~= nil then
+            slider:SetValue(scaleToSlider(value), false)
+        end
+        isInternalSliderUpdate = false
+        if shouldNotify and onValueChanged then
+            onValueChanged(value)
+        end
+    end
+
+    local initialValue = normalizeValue(defaultValue)
+    setSliderValue(initialValue, false)
+
+    slider:SetHandler("OnSliderChanged", function(_, rawValue)
+        if isInternalSliderUpdate then
+            return
+        end
+        local value = normalizeValue(scaleFromSlider(rawValue))
+        setSliderValue(value, true)
+    end)
+
+    local tooltip = nil
+    if false and tooltipText and tooltipText ~= "" then
+        tooltip = helpers.createTooltip("tooltip_" .. tostring(math.random(1000, 9999)), slider, tooltipText, 0, 0)
+    end
+
+    return slider, label, valueLabel, tooltip
+end
+
+function helpers.CreateCounterWithLabel(parent, anchorInfo, labelText, width, defaultValue, minValue, maxValue, step, onValueChanged, tooltipText)
+    local label = parent:CreateChildWidget("label", "label_" .. tostring(math.random(1000, 9999)), 0, true)
+
+    if anchorInfo.anchor then
+        label:AddAnchor(anchorInfo.anchor, anchorInfo.target, anchorInfo.relativeAnchor or anchorInfo.anchor, anchorInfo.x or 0, anchorInfo.y or 0)
+    end
+
+    label:SetText(labelText or "")
+    label.style:SetAlign(ALIGN.LEFT)
+    label.style:SetFontSize(labelFontSize)
+    ApplyTextColor(label, lableFontColor)
+
+    local totalWidth = (width and width > 0) and width or counterWidth
+    local smallLayout = totalWidth <= 64
+    local buttonWidth = smallLayout and 14 or 16
+    local buttonHeight = 20
+    local gap = 1
+    local valueWidth = math.max(18, totalWidth - (buttonWidth * 2) - (gap * 2))
+
+    local minusButton = parent:CreateChildWidget("button", "counterMinus_" .. tostring(math.random(1000, 9999)), 0, true)
+    minusButton:AddAnchor("TOPLEFT", label, "BOTTOMLEFT", 0, 8)
+    minusButton:SetText("-")
+    ApplyButtonSkin(minusButton, BUTTON_BASIC.RESET)
+    minusButton:SetAutoResize(false)
+    minusButton:SetExtent(buttonWidth, buttonHeight)
+    minusButton.style:SetFontSize(12)
+    ApplyButtonTextColor(minusButton, FONT_COLOR.DEFAULT)
+
+    local valueLabel = parent:CreateChildWidget("label", "counterValue_" .. tostring(math.random(1000, 9999)), 0, true)
+    valueLabel:AddAnchor("LEFT", minusButton, "RIGHT", gap, 0)
+    valueLabel:SetExtent(valueWidth, counterHeight)
+    valueLabel.style:SetAlign(ALIGN.CENTER)
+    valueLabel.style:SetFontSize(dropDownFontSize)
+    ApplyTextColor(valueLabel, dropDownFontColor)
+
+    local plusButton = parent:CreateChildWidget("button", "counterPlus_" .. tostring(math.random(1000, 9999)), 0, true)
+    plusButton:AddAnchor("LEFT", valueLabel, "RIGHT", gap, 0)
+    plusButton:SetText("+")
+    ApplyButtonSkin(plusButton, BUTTON_BASIC.RESET)
+    plusButton:SetAutoResize(false)
+    plusButton:SetExtent(buttonWidth, buttonHeight)
+    plusButton.style:SetFontSize(12)
+    ApplyButtonTextColor(plusButton, FONT_COLOR.DEFAULT)
+
+    local counterStep = tonumber(step)
+    if counterStep == nil then
+        counterStep = 1
+        tooltipText = onValueChanged
+        onValueChanged = step
+    end
+
+    local function getStepDecimals(value)
+        local text = tostring(value or "")
+        local dotIndex = string.find(text, ".", 1, true)
+        if not dotIndex then
+            return 0
+        end
+        return string.len(text) - dotIndex
+    end
+
+    local stepDecimals = getStepDecimals(counterStep)
+
+    local function formatValue(value)
+        if stepDecimals <= 0 then
+            return tostring(math.floor(value + 0.5))
+        end
+
+        local formatted = string.format("%." .. tostring(stepDecimals) .. "f", value)
+        formatted = formatted:gsub("(%..-)0+$", "%1")
+        formatted = formatted:gsub("%.$", "")
+        return formatted
+    end
+
+    local function clampValue(value)
+        value = tonumber(value) or minValue or 0
+        if minValue ~= nil and value < minValue then
+            value = minValue
+        end
+        if maxValue ~= nil and value > maxValue then
+            value = maxValue
+        end
+
+        local baseValue = tonumber(minValue) or 0
+        local snappedSteps = math.floor(((value - baseValue) / counterStep) + 0.5)
+        local snappedValue = baseValue + (snappedSteps * counterStep)
+
+        if minValue ~= nil and snappedValue < minValue then
+            snappedValue = minValue
+        end
+        if maxValue ~= nil and snappedValue > maxValue then
+            snappedValue = maxValue
+        end
+
+        return tonumber(string.format("%.6f", snappedValue)) or snappedValue
+    end
+
+    local currentValue = clampValue(defaultValue)
+
+    function valueLabel:Refresh()
+        self:SetText(formatValue(currentValue))
+        minusButton:Enable(minValue == nil or currentValue > minValue)
+        plusButton:Enable(maxValue == nil or currentValue < maxValue)
+    end
+
+    function valueLabel:SetValue(newValue, shouldNotify)
+        local clampedValue = clampValue(newValue)
+        if clampedValue == currentValue and not shouldNotify then
+            return
+        end
+        currentValue = clampedValue
+        self:Refresh()
+        if shouldNotify and onValueChanged then
+            onValueChanged(currentValue)
+        end
+    end
+
+    function valueLabel:GetValue()
+        return currentValue
+    end
+
+    function minusButton:OnClick()
+        valueLabel:SetValue(currentValue - counterStep, true)
+    end
+    minusButton:SetHandler("OnClick", minusButton.OnClick)
+
+    function plusButton:OnClick()
+        valueLabel:SetValue(currentValue + counterStep, true)
+    end
+    plusButton:SetHandler("OnClick", plusButton.OnClick)
+
+    valueLabel:Refresh()
+
+    local tooltip = nil
+    if tooltipText and tooltipText ~= "" then
+        tooltip = helpers.createTooltip("tooltip_" .. tostring(math.random(1000, 9999)), valueLabel, tooltipText, 0, 0)
+    end
+
+    return valueLabel, label, minusButton, plusButton, tooltip
 end
 
 function helpers.DefaultTooltipSetting(widget)

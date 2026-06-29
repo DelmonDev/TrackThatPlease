@@ -1,5 +1,5 @@
 local api = require("api")
-local logsPath = "TrackThatPlease/buff_logs/buffsLogs.txt"
+local logsPath = "TrackThatPlease/buffsLogs.txt"
 local BuffsLogger = {}
 BuffsLogger.isActive = false
 
@@ -70,7 +70,7 @@ local function appendNewBuff(buff, unitName, buffTooltip)
         buffsSet[buff.buff_id] = entry
 
         -- log new buffs
-        api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%d]|r = |cFFDDA0DD%s|r", tostring(entry.id), tostring(entry.name)))
+        -- api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%d]|r = |cFFDDA0DD%s|r", tostring(entry.id), tostring(entry.name)))
 
         saveToFile()
         api:Emit("TTP_NEW_BUFF_LOGGED")

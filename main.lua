@@ -1,21 +1,18 @@
 local api = require("api")
 local BuffSettingsWindow = require("TrackThatPlease/buff_settings_wnd")
-local helpers = require("TrackThatPlease/util/helpers")
 local BuffsLogger = require("TrackThatPlease/util/buff_logger")
 local BuffList = require("TrackThatPlease/buff_helper")
-local stopReccordingIconPath = "../Addon/TrackThatPlease/icons/rec-button.png"
-local openSettingsBtnStopIcon
 
 -- Addon Information
 local TargetBuffTrackerAddon = {
     name = "TrackThatPlease",
     author = "Dehling/Fortuno",
-    version = "2.2",
+    version = "2.3",
     desc = "Tracks buffs/debuffs on target, with UI"
 }
 
---FORK Option by @Fortuno for colored buff debuff borders
---FORK Idea by @mykeew to implement targeting for Target and Self (Player), now properly implemented
+-- in 2.3 improved settings window 
+
 
 -- UI Elements
 local playerBuffCanvas
@@ -27,6 +24,9 @@ local targetBuffLabels = {}
 local playerBuffStackLabels = {}
 local targetBuffStackLabels = {}
 local openSettingsBtn
+local playerUnitFrame
+local targetUnitFrame
+local addonOptionsEntryTitle = "TrackThatPlease"
 
 -- Variables
 local previousPlayerXYZString = "0,0,0"
@@ -119,11 +119,11 @@ local function SmoothPosition(current, last, deltaTime, unitType)
     }
 end
 
-local buffBlinkSpeed = 5 -- Speed of the blink effect
 local function GetBlinkAlpha(minAlpha, maxAlpha, timer)
+    local blinkSpeed = BuffSettingsWindow.settings.buffBlinkSpeed or 5
     local amplitude = (maxAlpha - minAlpha) / 2
     local mid = (maxAlpha + minAlpha) / 2
-    return mid + amplitude * math.sin(timer * buffBlinkSpeed)
+    return mid + amplitude * math.sin(timer * blinkSpeed * 2)
 end
 
 -- Function to check if a buff is being watched for player or target
@@ -143,6 +143,23 @@ local function CreateBuffElement(index, canvas)
     icon:Clickable(false)
     icon:SetExtent(BuffSettingsWindow.settings.iconSize, BuffSettingsWindow.settings.iconSize)
     icon:Show(false)
+    icon.buffTooltipText = nil
+
+    function icon:OnEnter()
+        if not self.buffTooltipText or self.buffTooltipText == "" then
+            return
+        end
+
+        local posX, posY = api.Input:GetMousePos()
+        api.Interface:SetTooltipOnPos(self.buffTooltipText, self, posX, posY)
+    end
+
+    function icon:OnLeave()
+        api.Interface:SetTooltipOnPos(nil, self, 0, 0)
+    end
+
+    icon:SetHandler("OnEnter", icon.OnEnter)
+    icon:SetHandler("OnLeave", icon.OnLeave)
 
     -- Create a border around the icon
     local borderSize = 1
@@ -195,6 +212,7 @@ local function CreateBuffElement(index, canvas)
     timeLabel.style:SetShadow(true)
     timeLabel.style:SetOutline(true)
     timeLabel:Show(false)
+    timeLabel:Clickable(false)
     timeLabel.style:SetColor(1, 1, 1, 1)
 
     local stackLabel = canvas:CreateChildWidget("label", "buffStackLabel" .. index, 0, true)
@@ -210,6 +228,7 @@ local function CreateBuffElement(index, canvas)
     stackLabel.style:SetOutline(true)
     stackLabel.style:SetColor(0.97, 0.91, 0.81, 0.9)
     stackLabel:SetAlpha(0.80) 
+    stackLabel:Clickable(false)
 
     stackLabel:Show(false)
 
@@ -255,6 +274,119 @@ local function GetPositionAdjustment()
         [120] = { x = 0, y = 6 },
     }
     return adjustments[uiScale] or { x = 0, y = 0 }
+end
+
+local function GetTrackedUnitFrame(unitType)
+    if ADDON == nil or type(ADDON.GetContent) ~= "function" or UIC == nil then
+        return nil
+    end
+
+    if unitType == "player" then
+        if playerUnitFrame == nil and UIC.PLAYER_UNITFRAME ~= nil then
+            playerUnitFrame = ADDON:GetContent(UIC.PLAYER_UNITFRAME)
+        end
+        return playerUnitFrame
+    end
+
+    if targetUnitFrame == nil and UIC.TARGET_UNITFRAME ~= nil then
+        targetUnitFrame = ADDON:GetContent(UIC.TARGET_UNITFRAME)
+    end
+    return targetUnitFrame
+end
+
+local function EnsureAddonOptionsMenu()
+    if ADDON == nil or type(ADDON.GetContent) ~= "function" or UIC == nil or UIC.SYSTEM_CONFIG_FRAME == nil then
+        return nil
+    end
+
+    local configMenu = ADDON:GetContent(UIC.SYSTEM_CONFIG_FRAME)
+    if configMenu == nil then
+        return nil
+    end
+
+    if configMenu.michaelClient == nil then
+        local michaelClient = configMenu:CreateChildWidget("label", "michaelClient", 0, true)
+        michaelClient:AddAnchor("TOPLEFT", configMenu, -110, 5)
+        michaelClient:SetExtent(110, 28)
+        michaelClient:SetText("Addon Options")
+        michaelClient.addons = {}
+        michaelClient.addonCount = 0
+
+        michaelClient.bg = michaelClient:CreateNinePartDrawable("ui/common/tab_list.dds", "background")
+        michaelClient.bg:SetTextureInfo("bg_quest")
+        michaelClient.bg:SetColor(0, 0, 0, 0.5)
+        michaelClient.bg:AddAnchor("TOPLEFT", michaelClient, 0, 0)
+        michaelClient.bg:AddAnchor("BOTTOMRIGHT", michaelClient, 0, 0)
+
+        function michaelClient:AddAddon(title, callback)
+            local addonButton = self.addons[title]
+
+            if addonButton == nil then
+                self.addonCount = self.addonCount + 1
+                addonButton = self:CreateChildWidget("button", title, 0, true)
+                addonButton:SetText(title)
+                addonButton:AddAnchor("TOPLEFT", self, 5, self.addonCount * 30)
+                addonButton:SetExtent(100, 28)
+
+                addonButton.bg = addonButton:CreateNinePartDrawable("ui/common/tab_list.dds", "background")
+                addonButton.bg:SetTextureInfo("bg_quest")
+                addonButton.bg:SetColor(0, 0, 0, 0.5)
+                addonButton.bg:AddAnchor("TOPLEFT", addonButton, 0, 0)
+                addonButton.bg:AddAnchor("BOTTOMRIGHT", addonButton, 0, 0)
+
+                self.addons[title] = addonButton
+
+                local currentWidth = michaelClient.bg:GetWidth()
+                michaelClient.bg:SetExtent(currentWidth, self.addonCount * 30)
+                michaelClient.bg:RemoveAllAnchors()
+                michaelClient.bg:AddAnchor("TOPLEFT", michaelClient, 0, 0)
+                michaelClient.bg:AddAnchor("BOTTOMRIGHT", michaelClient, 0, self.addonCount * 30 + 10)
+            end
+
+            addonButton:SetHandler("OnClick", function()
+                callback()
+            end)
+
+            return addonButton
+        end
+
+        configMenu.michaelClient = michaelClient
+    end
+
+    return configMenu
+end
+
+local function RegisterAddonOptionsEntry()
+    local configMenu = EnsureAddonOptionsMenu()
+    if configMenu == nil or configMenu.michaelClient == nil then
+        return
+    end
+
+    configMenu.michaelClient:AddAddon(addonOptionsEntryTitle, function()
+        BuffSettingsWindow.ToggleBuffSelectionWindow()
+    end)
+end
+
+local function UnregisterAddonOptionsEntry()
+    if ADDON == nil or type(ADDON.GetContent) ~= "function" or UIC == nil or UIC.SYSTEM_CONFIG_FRAME == nil then
+        return
+    end
+
+    local configMenu = ADDON:GetContent(UIC.SYSTEM_CONFIG_FRAME)
+    if configMenu == nil or configMenu.michaelClient == nil or configMenu.michaelClient.addons == nil then
+        return
+    end
+
+    local addonButton = configMenu.michaelClient.addons[addonOptionsEntryTitle]
+    if addonButton ~= nil then
+        api.Interface:Free(addonButton)
+        configMenu.michaelClient.addons[addonOptionsEntryTitle] = nil
+    end
+
+    if next(configMenu.michaelClient.addons) == nil then
+        api.Interface:Free(configMenu.michaelClient)
+        configMenu.michaelClient = nil
+    end
 end
 
 -- Function to collect all watched buffs and debuffs
@@ -330,6 +462,7 @@ local function UpdateBuffIconsAndTimers(buffs, icons, timeLabels, stackLabels, m
         local stackLabel = stackLabels[i]
 
         F_SLOT.SetIconBackGround(icon, buff.path)
+        icon.buffTooltipText = api.Ability:GetBuffTooltip(buff.buff_id, 1)
         
 
         if buff.isBuff then
@@ -345,14 +478,15 @@ local function UpdateBuffIconsAndTimers(buffs, icons, timeLabels, stackLabels, m
         if buff.timeLeft and buff.timeLeft > 0 then
             -- Timers ----------------------------------------------------------------
             local timerText = ""
-            local warnTime = (buff.isBuff and BuffSettingsWindow.settings.buffWarnTime) 
+            local warnTime = (buff.isBuff and BuffSettingsWindow.settings.buffWarnTime)
                 or (not buff.isBuff and BuffSettingsWindow.settings.debuffWarnTime)
+            warnTime = math.max(500, math.floor((warnTime / 500) + 0.5) * 500)
 
             if buff.timeLeft > 5940000 then -- More than 99 minutes (99 * 60 * 1000 ms)
                 timerText = string.format("%dh", math.floor(buff.timeLeft / 3600000)) -- Convert to hours
             elseif buff.timeLeft > 60000 then -- More than 1 minute but less than 99 minutes
                 timerText = string.format("%dm", math.floor(buff.timeLeft / 60000))
-            elseif buff.timeLeft >= warnTime then
+            elseif buff.timeLeft > warnTime then
                 timerText = string.format("%ds", math.floor(buff.timeLeft / 1000))
             else -- Less than warnTime
                 timerText = string.format("%.1f", buff.timeLeft / 1000)
@@ -391,7 +525,7 @@ local function UpdateBuffIconsAndTimers(buffs, icons, timeLabels, stackLabels, m
             )
 
             if shouldBlink then
-                local alpha = GetBlinkAlpha(0.45, 1, blinkTimer)
+                local alpha = GetBlinkAlpha(0.30, 1, blinkTimer)
                 icon:SetAlpha(alpha)
                 timeLabel:SetAlpha(alpha)
                 stackLabel:SetAlpha(alpha)
@@ -419,47 +553,59 @@ local function HideUnusedBuffSlots(buffIcons, buffLabels, stackLabels, maxBuffsT
 end
 
 local function UpdateBuffsPositionWithSmoothing(unitType, dt)
+    local previousXYZSmoothed, previousXYZString, canvas, baseOffsetX, baseOffsetY, shouldShowAboveUnitFrame
+
+    if unitType == "player" then
+        previousXYZSmoothed = previousPlayerXYZSmothed
+        previousXYZString = previousPlayerXYZString
+        canvas = playerBuffCanvas
+        baseOffsetX = BuffSettingsWindow.settings.playerBuffHorizontalOffset
+        baseOffsetY = BuffSettingsWindow.settings.playerBuffVerticalOffset
+        shouldShowAboveUnitFrame = BuffSettingsWindow.settings.showAbovePlayerUnitFrame
+    else -- target
+        previousXYZSmoothed = previousTargetXYZSmothed
+        previousXYZString = previousTargetXYZString
+        canvas = targetBuffCanvas
+        baseOffsetX = BuffSettingsWindow.settings.targetBuffHorizontalOffset
+        baseOffsetY = BuffSettingsWindow.settings.targetBuffVerticalOffset
+        shouldShowAboveUnitFrame = BuffSettingsWindow.settings.showAboveTargetUnitFrame
+    end
+
+    local adjustment = GetPositionAdjustment()
+
+    if shouldShowAboveUnitFrame then
+        local unitFrame = GetTrackedUnitFrame(unitType)
+        if unitFrame ~= nil then
+            canvas:RemoveAllAnchors()
+            canvas:AddAnchor("BOTTOM", unitFrame, "TOP", baseOffsetX + adjustment.x, baseOffsetY + adjustment.y)
+            canvas:Show(true)
+            return
+        end
+    end
+
     local x, y, z = api.Unit:GetUnitScreenPosition(unitType)
-    
     if x and y and z then
         local currentPos = {x = x, y = y, z = z}
-        
-        local previousXYZSmoothed, previousXYZString, canvas, baseOffsetY
-        
-        if unitType == "player" then
-            previousXYZSmoothed = previousPlayerXYZSmothed
-            previousXYZString = previousPlayerXYZString
-            canvas = playerBuffCanvas
-            baseOffsetY = BuffSettingsWindow.settings.playerBuffVerticalOffset
-        else -- target
-            previousXYZSmoothed = previousTargetXYZSmothed
-            previousXYZString = previousTargetXYZString
-            canvas = targetBuffCanvas
-            baseOffsetY = BuffSettingsWindow.settings.targetBuffVerticalOffset
-        end
-        
         local smoothPos = SmoothPosition(currentPos, previousXYZSmoothed, dt, unitType)
-        
+
         local smoothedPosString = string.format("%.3f,%.3f,%.3f", smoothPos.x, smoothPos.y, smoothPos.z)
         if previousXYZString ~= smoothedPosString then
-            local adjustment = GetPositionAdjustment()
-            
             canvas:RemoveAllAnchors()
-            canvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT", 
-                smoothPos.x + adjustment.x, 
+            canvas:AddAnchor("BOTTOM", "UIParent", "TOPLEFT",
+                smoothPos.x + baseOffsetX + adjustment.x,
                 smoothPos.y + baseOffsetY + adjustment.y)
-            
+
             if unitType == "player" then
                 previousPlayerXYZString = smoothedPosString
             else -- target
                 previousTargetXYZString = smoothedPosString
             end
         end
-        
+
         previousXYZSmoothed.x = smoothPos.x
         previousXYZSmoothed.y = smoothPos.y
         previousXYZSmoothed.z = smoothPos.z
-        
+
         canvas:Show(previousXYZSmoothed.z >= 0 and previousXYZSmoothed.z <= 100)
     end
 end
@@ -585,6 +731,10 @@ local function OnNewBuffLogged()
     BuffSettingsWindow.RefreshLoggedBuffs()
 end
 local function OnBuffsLoggingStarted()
+    if openSettingsBtn == nil or openSettingsBtn.recordingIndicationIcon == nil then
+        return
+    end
+
     if not recordingIconAnimation.isActive then
         openSettingsBtn.recordingIndicationIcon:SetVisible(true)
         recordingIconAnimation.isActive = true
@@ -594,6 +744,11 @@ local function OnBuffsLoggingStarted()
     end
 end
 local function OnBuffsLoggingStopped()
+    if openSettingsBtn == nil or openSettingsBtn.recordingIndicationIcon == nil then
+        recordingIconAnimation.isActive = false
+        return
+    end
+
     recordingIconAnimation.isActive = false
     openSettingsBtn.recordingIndicationIcon:SetVisible(false)
     if openSettingsBtn and openSettingsBtn.recordingIndicationIcon then
@@ -608,6 +763,8 @@ local function OnLoad()
     BuffSettingsWindow.Initialize(BuffsLogger)
 
     uiScale = math.floor(BuffSettingsWindow.settings.UIScale * 100 + 0.5)
+    playerUnitFrame = GetTrackedUnitFrame("player")
+    targetUnitFrame = GetTrackedUnitFrame("target")
     -------------------------------------
 
     playerBuffCanvas = api.Interface:CreateEmptyWindow("playerBuffCanvas")
@@ -631,33 +788,11 @@ local function OnLoad()
     api.On("TTP_NEW_BUFF_LOGGED", OnNewBuffLogged)
     api.On("TTP_BUFFS_LOGGING_STARTED", OnBuffsLoggingStarted)
     api.On("TTP_BUFFS_LOGGING_STOPPED", OnBuffsLoggingStopped)
-
-    -- Toggle settings window visibility
-    openSettingsBtn = helpers.createOverlayButton("TrackThatPls", BuffSettingsWindow.settings.btnSettingsPos,
-        function ()
-          local PosX, PosY = openSettingsBtn:GetOffset()
-          BuffSettingsWindow.settings.btnSettingsPos = { PosX, PosY }
-          BuffSettingsWindow.SaveSettings()
-        end
-    )
-    openSettingsBtn:SetHandler("OnClick", function()
-        BuffSettingsWindow.ToggleBuffSelectionWindow()
-    end)
-    -- Create icon for button
-    local _w, buttonHeight = openSettingsBtn:GetExtent()
-    buttonHeight = math.floor(buttonHeight * 0.70)
-    local settingsIconDrawable = openSettingsBtn:CreateImageDrawable("Textures/Defaults/White.dds", "overlay")
-    settingsIconDrawable:SetExtent(buttonHeight, buttonHeight)
-    settingsIconDrawable:AddAnchor("RIGHT", openSettingsBtn, "LEFT", -3, 0)
-    settingsIconDrawable:SetSRGB(false)
-    settingsIconDrawable:SetVisible(false)
-    settingsIconDrawable:SetTgaTexture(stopReccordingIconPath)
-    openSettingsBtn.recordingIndicationIcon = settingsIconDrawable
-    
+    RegisterAddonOptionsEntry()
     
     BuffSettingsWindow.RefreshLoggedBuffs()
 
-    api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to access the TrackList \n or use the Button from UI")
+    api.Log:Info("TrackThatPlease had been loaded. Type - ttp - in chat to access the TrackList \n or open it from Addon Options.")
 end
 
 -- Unload function to clean up
@@ -672,9 +807,12 @@ local function OnUnload()
         BuffSettingsWindow = nil
     end
 
+    UnregisterAddonOptionsEntry()
+
     -- Clean up settings button
     if openSettingsBtn then
         openSettingsBtn:Show(false)
+        api.Interface:Free(openSettingsBtn)
         openSettingsBtn = nil
     end
 
@@ -689,6 +827,9 @@ local function OnUnload()
         targetBuffCanvas:Show(false)
         targetBuffCanvas = nil
     end
+
+    playerUnitFrame = nil
+    targetUnitFrame = nil
 
     api.Log:Err("TrackThatPlease: Unload completed successfully")
 end

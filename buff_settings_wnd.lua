@@ -6,7 +6,7 @@ local BuffsLogger
 local BuffSettingsWindow = {}
 BuffSettingsWindow.settings = {}
 -- Last element of maxBuffsOptions must be equal to this
-BuffSettingsWindow.MAX_BUFFS_COUNT = 13 
+BuffSettingsWindow.MAX_BUFFS_COUNT = 25 
 
 local serializedSettings = {}
 
@@ -28,13 +28,27 @@ local filteredBuffs = {}
 local currentTrackType = 1  -- 1 for Player, 2 for Target
 local isSelectedAll = false
 
-local maxBuffsOptions = {"3", "5", "7", "9", "11", "13"} -- Last element must be equal to BuffSettingsWindow.MAX_BUFFS_COUNT
-local iconSpacingOptions = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
-local iconSizeOptions = {"25", "28", "30", "32", "34", "36", "38", "40", "42", "44", "46", "48", "50", "52", "54", "56", "58"}
-local fontSizeOptions = {"10", "11", "12", "13", "14", "15", "16", "18", "20", "22", "24", "26", "28", "30", "32", "34", "36"}
-local warnTimeOptions = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
-local buffsYOffsetOptions = {"-52", "-48", "-46", "-44", "-42", "-40", "-38", "-36", "-32", "-28", "-24"}
-local smoothingSpeedOptions = { "0", "2", "4", "6", "8", "12", "16", "18", "20", "24", "28", "32", "36" }
+local function BuildNumericOptions(minValue, maxValue, step)
+    local options = {}
+    local value = minValue
+
+    while value <= maxValue do
+        table.insert(options, tostring(value))
+        value = value + step
+    end
+
+    return options
+end
+
+local maxBuffsOptions = BuildNumericOptions(1, BuffSettingsWindow.MAX_BUFFS_COUNT, 1)
+local iconSpacingOptions = BuildNumericOptions(0, 20, 1)
+local iconSizeOptions = BuildNumericOptions(16, 64, 1)
+local fontSizeOptions = BuildNumericOptions(8, 40, 1)
+local warnTimeOptions = BuildNumericOptions(0.5, 30, 0.5)
+local buffsXOffsetOptions = BuildNumericOptions(-300, 300, 1)
+local buffsYOffsetOptions = BuildNumericOptions(-200, 200, 1)
+local smoothingSpeedOptions = BuildNumericOptions(0, 40, 1)
+local blinkSpeedOptions = BuildNumericOptions(0.5, 5, 0.5)
 local buffScrollListWidth
 
 -- Scroll and pagination
@@ -57,6 +71,25 @@ end
 
 local function DeserializeNumber(str)
     return tonumber(str)
+end
+
+local function GetOptionBounds(options)
+    local minValue = tonumber(options[1])
+    local maxValue = tonumber(options[#options])
+    return minValue, maxValue
+end
+
+local function NormalizeWarnTimeMilliseconds(value, defaultValue)
+    local numericValue = tonumber(value) or defaultValue or 1000
+    local normalizedHalfSeconds = math.floor((numericValue / 500) + 0.5)
+
+    if normalizedHalfSeconds < 1 then
+        normalizedHalfSeconds = 1
+    elseif normalizedHalfSeconds > 60 then
+        normalizedHalfSeconds = 60
+    end
+
+    return normalizedHalfSeconds * 500
 end
 
 local function PrintBuffWatchWindowSettings()
@@ -126,14 +159,19 @@ local function loadSettings()
     local defaultSettings = {
         UIScale = api.Interface:GetUIScale(),
         fontSize = 12,
+        targetBuffHorizontalOffset = 0,
         targetBuffVerticalOffset = -38,
+        playerBuffHorizontalOffset = 0,
         playerBuffVerticalOffset = -38,
+        showAbovePlayerUnitFrame = false,
+        showAboveTargetUnitFrame = false,
         iconSize = 34,
         iconSpacing = 3,
         maxBuffsShown = 5,
         debuffWarnTime = 2000,
         buffWarnTime = 3000,
         smoothingSpeed = 8,
+        buffBlinkSpeed = 5,
         shouldShowStacks = true,
         btnSettingsPos = { defaultX, 25 },
     }
@@ -178,6 +216,18 @@ local function loadSettings()
     for k, defaultValue in pairs(defaultSettings) do
         BuffSettingsWindow.settings[k] = ensureType(serializedSettings[k], defaultValue)
     end
+
+    BuffSettingsWindow.settings.debuffWarnTime = NormalizeWarnTimeMilliseconds(
+        BuffSettingsWindow.settings.debuffWarnTime,
+        defaultSettings.debuffWarnTime
+    )
+    BuffSettingsWindow.settings.buffWarnTime = NormalizeWarnTimeMilliseconds(
+        BuffSettingsWindow.settings.buffWarnTime,
+        defaultSettings.buffWarnTime
+    )
+
+    serializedSettings.debuffWarnTime = BuffSettingsWindow.settings.debuffWarnTime
+    serializedSettings.buffWarnTime = BuffSettingsWindow.settings.buffWarnTime
     
     -- Load player buffs from serialized data
     local savedPlayerBuffs = serializedSettings.playerWatchedBuffs or {}
@@ -424,12 +474,11 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
         -- get back line carriages
         local formattedDescription = string.gsub(subItem.description, "\\n", "\n")
 
-        local PosX, PosY = self:GetOffset()
-        api.Interface:SetTooltipOnPos(formattedDescription, subItem.subItemIcon, PosX, PosY + 5)
+        local posX, posY = api.Input:GetMousePos()
+        api.Interface:SetTooltipOnPos(formattedDescription, subItem.subItemIcon, posX, posY)
     end
     function subItemIcon:OnLeave()
-        local PosX, PosY = self:GetOffset()
-        api.Interface:SetTooltipOnPos(nil, subItem.subItemIcon, PosX, PosY + 5)
+        api.Interface:SetTooltipOnPos(nil, subItem.subItemIcon, 0, 0)
     end
     subItemIcon:SetHandler("OnEnter", subItemIcon.OnEnter)
     subItemIcon:SetHandler("OnLeave", subItemIcon.OnLeave)
@@ -601,31 +650,35 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     BuffList.InitializeAllBuffs(buffsLogger)
     ----------------------------------------
 
-   -- Create Settings UI elements-----------------
-   -- Layout variables
+    -- Create Settings UI elements-----------------
+    -- Layout variables
     local columnGap = 18
-    local columnWidth = 80
-    local rowHeight = 55
-    local leftMargin = 40
-    local topMargin = 50
-    -- Column positions
-    local x1 = leftMargin                                
-    local x2 = leftMargin + columnWidth + columnGap      
-    local x3 = leftMargin + (columnWidth + columnGap) * 2
-    local x4 = leftMargin + (columnWidth + columnGap) * 3
-    --local x5 = leftMargin + (columnWidth + columnGap) * 4
-    -- Row positions
-    local y1 = topMargin                                 
-    local y2 = y1 + rowHeight                     
-    local y3 = y2 + rowHeight             
-    local y4 = y3 + rowHeight        
-    local y5 = y4 + rowHeight          
+    local columnWidth = 160
+    local sliderRowHeight = 60
+    local positionRowHeight = 60
+    local controlRowHeight = 60
+    local controlsTopGap = 4
+     local leftMargin = 28
+     local topMargin = 52
+     -- Column positions
+     local x1 = leftMargin
+     local x2 = leftMargin + columnWidth + columnGap
+     local x3 = leftMargin + (columnWidth + columnGap) * 2
+     -- Row positions
+     local y1 = topMargin
+     local y2 = y1 + sliderRowHeight
+     local y3 = y2 + sliderRowHeight
+     local y4 = y3 + sliderRowHeight
+    local y5 = y4 + positionRowHeight
+    local y6 = y5 + controlRowHeight + controlsTopGap
+    local y7 = y6 + controlRowHeight
+    local y8 = y7 + controlRowHeight
     
     
     --================= Create the main window =================--
     buffSelectionWindow = api.Interface:CreateWindow("buffSelectorWindow", "Track List")
-    buffSelectionWindow:SetWidth(500)
-    buffSelectionWindow:SetHeight(750)
+    buffSelectionWindow:SetWidth(600)
+    buffSelectionWindow:SetHeight(900)
     buffSelectionWindow:AddAnchor("CENTER", "UIParent", "CENTER", 0, 0)
 
     local function createAnchor(x, y)
@@ -643,22 +696,29 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         maxBuffsDropdown = createAnchor(x1, y1),
         fontSizeDropdown = createAnchor(x2, y1),
         iconSizeDropdown = createAnchor(x3, y1),
-        iconSpacingDropdown = createAnchor(x4, y1),
         -- Row 2
-        debuffWarnTimeDropdown = createAnchor(x1, y2),
-        buffWarnTimeDropdown = createAnchor(x2, y2),
-        smoothingSpeedDropdown = createAnchor(x3, y2),
-        playerVerticalOffsetDropdown = createAnchor(x4, y2),
-        targetVerticalOffsetDropdown = createAnchor(x4 + 68, y2),
+        iconSpacingDropdown = createAnchor(x1, y2),
+        debuffWarnTimeDropdown = createAnchor(x2, y2),
+        buffWarnTimeDropdown = createAnchor(x3, y2),
         -- Row 3
-        trackTypeDropdown = createAnchor(x1, y3),
-        categoryDropdown = createAnchor(x2, y3),
-        shouldShowStacksCheckbox = createAnchor(x4, y3),
+        smoothingSpeedDropdown = createAnchor(x1, y3),
+        blinkSpeedDropdown = createAnchor(x2, y3),
+        playerHorizontalOffsetDropdown = createAnchor(x1, y4),
+        playerVerticalOffsetDropdown = createAnchor(x2, y4),
+        targetHorizontalOffsetDropdown = createAnchor(x1, y5),
+        targetVerticalOffsetDropdown = createAnchor(x2, y5),
         -- Row 4
-        searchEditBox = createAnchor(x1, y4),
+        playerAboveUnitFrameCheckbox = createAnchor(x3, y4 + 18),
+        targetAboveUnitFrameCheckbox = createAnchor(x3, y5 + 18),
         -- Row 5
-        buffScrollList = createAnchor(leftMargin, y5),
-        selectAllButton = createAnchor(x4, y5 - 40) ,
+        trackTypeDropdown = createAnchor(x1, y6),
+        categoryDropdown = createAnchor(x2, y6),
+        shouldShowStacksCheckbox = createAnchor(x3, y6),
+        -- Row 6
+        searchEditBox = createAnchor(x1, y7),
+        selectAllButton = createAnchor(x3 + 16, y7 + 16),
+        -- Row 7
+        buffScrollList = createAnchor(leftMargin, y8),
     }
 
     --================= Create trackTypeDropdown =================--
@@ -700,209 +760,253 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     )
     
 
-    --================= Create max buffs dropdown =================--
-    local maxBuffsLabel
-    local maxBuffsIndex = 2 
-    -- Set from loaded settings
-    for i, value in ipairs(maxBuffsOptions) do
-        if tonumber(value) == BuffSettingsWindow.settings.maxBuffsShown then
-            maxBuffsIndex = i   
-            break
-        end
-    end
-    local maxBuffsDropdown, maxBuffsLabel = helpers.CreateDropdownWithLabel(
+    --================= Create numeric sliders =================--
+    local maxBuffsMin, maxBuffsMax = GetOptionBounds(maxBuffsOptions)
+    local _, maxBuffsLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.maxBuffsDropdown,
-        "Max buffs:",
-        0,
-        maxBuffsOptions,
-        maxBuffsIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.maxBuffsShown = tonumber(selectedValue)
+        "Max buffs to display:",
+        columnWidth,
+        BuffSettingsWindow.settings.maxBuffsShown,
+        maxBuffsMin,
+        maxBuffsMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.maxBuffsShown = value
             BuffSettingsWindow.SaveSettings()
         end,
         "Maximum number of tracked buffs to display"
     )
 
-    --================= Create Icon Size dropdown =================--
-    local iconSizeIndex = 5 -- Default 34
-    -- Set from loaded settings
-    for i, value in ipairs(iconSizeOptions) do
-        if tonumber(value) == BuffSettingsWindow.settings.iconSize then
-            iconSizeIndex = i   
-            break
-        end
-    end
-    local iconSizeDropdown, iconSizeLabel = helpers.CreateDropdownWithLabel(
+    local iconSizeMin, iconSizeMax = GetOptionBounds(iconSizeOptions)
+    local _, iconSizeLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.iconSizeDropdown,
         "Icon size:",
-        0,
-        iconSizeOptions,
-        iconSizeIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.iconSize = tonumber(selectedValue)
+        columnWidth,
+        BuffSettingsWindow.settings.iconSize,
+        iconSizeMin,
+        iconSizeMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.iconSize = value
             BuffSettingsWindow.SaveSettings()
         end
     )
 
-    --================= Create Icon Size dropdown =================--
-    local iconSpacingIndex = 3 -- Default 3
-    -- Set from loaded settings
-    for i, value in ipairs(iconSpacingOptions) do
-        if tonumber(value) == BuffSettingsWindow.settings.iconSpacing then
-            iconSpacingIndex = i   
-            break
-        end
-    end
-    local iconSpacingDropdown, iconSpacingLabel = helpers.CreateDropdownWithLabel(
+    local iconSpacingMin, iconSpacingMax = GetOptionBounds(iconSpacingOptions)
+    local _, iconSpacingLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.iconSpacingDropdown,
         "Icon spacing:",
-        0,
-        iconSpacingOptions,
-        iconSpacingIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.iconSpacing = tonumber(selectedValue)
+        columnWidth,
+        BuffSettingsWindow.settings.iconSpacing,
+        iconSpacingMin,
+        iconSpacingMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.iconSpacing = value
             BuffSettingsWindow.SaveSettings()
         end
     )
 
-    --================= Create Font Size dropdown =================--
-    local fontSizeIndex = 4 -- Default 12
-    -- Set from loaded settings
-    for i, value in ipairs(fontSizeOptions) do
-        if tonumber(value) == BuffSettingsWindow.settings.fontSize then
-            fontSizeIndex = i   
-            break
-        end
-    end
-    local fontSizeDropdown, fontSizeLabel = helpers.CreateDropdownWithLabel(
+    local fontSizeMin, fontSizeMax = GetOptionBounds(fontSizeOptions)
+    local _, fontSizeLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.fontSizeDropdown,
         "Text size:",
-        0,
-        fontSizeOptions,
-        fontSizeIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.fontSize = tonumber(selectedValue)
+        columnWidth,
+        BuffSettingsWindow.settings.fontSize,
+        fontSizeMin,
+        fontSizeMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.fontSize = value
             BuffSettingsWindow.SaveSettings()
         end
     )
 
-    -- Create debuffWarnTime dropdown
-    local debuffWarnTimeIndex = BuffSettingsWindow.settings.debuffWarnTime / 1000 -- Convert ms to seconds
-    local debuffWarnTimeDropdown, debuffWarnTimeLabel = helpers.CreateDropdownWithLabel(
+    local warnTimeMin, warnTimeMax = GetOptionBounds(warnTimeOptions)
+    local _, debuffWarnTimeLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.debuffWarnTimeDropdown,
-        "Debuff warn:",
-        0, -- Use default width
-        warnTimeOptions,
-        debuffWarnTimeIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.debuffWarnTime = tonumber(selectedIndex) * 1000 -- Convert to milliseconds
+        "Debuff expiry warn(s):",
+        columnWidth,
+        BuffSettingsWindow.settings.debuffWarnTime / 1000,
+        warnTimeMin,
+        warnTimeMax,
+        0.5,
+        function(value)
+            BuffSettingsWindow.settings.debuffWarnTime = value * 1000
             BuffSettingsWindow.SaveSettings()
         end,
-        "Time (in sec) before debuff expires to start warning (blinking)"
+        nil,
+        2
     )
 
-    -- Create buffWarnTime dropdown
-    local buffWarnTimeIndex = BuffSettingsWindow.settings.buffWarnTime / 1000 -- Convert ms to seconds
-    local buffWarnTimeDropdown, buffWarnTimeLabel = helpers.CreateDropdownWithLabel(
+    local _, buffWarnTimeLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.buffWarnTimeDropdown,
-        "Buff warn:",
-        0, -- Use default width
-        warnTimeOptions,
-        buffWarnTimeIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.buffWarnTime = tonumber(selectedIndex) * 1000 -- Convert to milliseconds
+        "Buff expiry warn(s):",
+        columnWidth,
+        BuffSettingsWindow.settings.buffWarnTime / 1000,
+        warnTimeMin,
+        warnTimeMax,
+        0.5,
+        function(value)
+            BuffSettingsWindow.settings.buffWarnTime = value * 1000
             BuffSettingsWindow.SaveSettings()
         end,
-        "Time (in sec) before buff expires to start warning (blinking)"
+        nil,
+        2
     )
 
-    -- Create smoothingSpeed dropdown
-    local smoothingSpeedIndex = 5 -- Default to "12"
-    -- Set from loaded settings
-    for i, speed in ipairs(smoothingSpeedOptions) do
-        if tonumber(speed) == BuffSettingsWindow.settings.smoothingSpeed then
-            smoothingSpeedIndex = i
-            break
-        end
-    end
-    local smoothingSpeedDropdown, smoothingSpeedLabel = helpers.CreateDropdownWithLabel(
+    local smoothingMin, smoothingMax = GetOptionBounds(smoothingSpeedOptions)
+    local _, smoothingSpeedLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.smoothingSpeedDropdown,
-        "Smoothing:",
-        0, -- Use default width
-        smoothingSpeedOptions,
-        smoothingSpeedIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.smoothingSpeed = tonumber(selectedValue)
+        "Smoothing speed:",
+        columnWidth,
+        BuffSettingsWindow.settings.smoothingSpeed,
+        smoothingMin,
+        smoothingMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.smoothingSpeed = value
             BuffSettingsWindow.SaveSettings()
-        end,
-        "Speed of buff icons position update smoothing (for a player) \n (higher = faster response, lower = smoother movement (no jitter) \n 0 = no smoothing)",
-        -55
+        end
     )
 
-    -- Create player vertical offset dropdown (optional fourth dropdown)
-    local offsetIndex = 6 -- Default to "-38"
-    -- Set from loaded settings
-    for i, offset in ipairs(buffsYOffsetOptions) do
-        if tonumber(offset) == BuffSettingsWindow.settings.playerBuffVerticalOffset then
-            offsetIndex = i
-            break
+    local smoothingTooltipButton = buffSelectionWindow:CreateChildWidget("button", "smoothingTooltipButton", 0, true)
+    smoothingTooltipButton:AddAnchor("LEFT", smoothingSpeedLabel, "RIGHT", 6, 0)
+    smoothingTooltipButton:SetExtent(18, 18)
+    smoothingTooltipButton:SetText("?")
+    smoothingTooltipButton.style:SetFontSize(13)
+    smoothingTooltipButton:SetTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
+    smoothingTooltipButton:SetHighlightTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
+    smoothingTooltipButton:SetPushedTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
+    smoothingTooltipButton:SetDisabledTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
+    helpers.createTooltip(
+        "smoothingTooltip",
+        smoothingTooltipButton,
+        "Reduces jitter when buffs follow the player above the character instead of the unit frame.",
+        0,
+        -6
+    )
+
+    local blinkSpeedMin, blinkSpeedMax = GetOptionBounds(blinkSpeedOptions)
+    local _, blinkSpeedLabel = helpers.CreateSliderWithLabel(
+        buffSelectionWindow,
+        anchors.blinkSpeedDropdown,
+        "Warning blink speed:",
+        columnWidth,
+        BuffSettingsWindow.settings.buffBlinkSpeed,
+        blinkSpeedMin,
+        blinkSpeedMax,
+        0.5,
+        function(value)
+            BuffSettingsWindow.settings.buffBlinkSpeed = value
+            BuffSettingsWindow.SaveSettings()
         end
-    end
-    local playerVerticalOffsetDropdown, playerVerticalOffsetLabel = helpers.CreateDropdownWithLabel(
+    )
+
+    local offsetXMin, offsetXMax = GetOptionBounds(buffsXOffsetOptions)
+    local _, playerHorizontalOffsetLabel = helpers.CreateSliderWithLabel(
+        buffSelectionWindow,
+        anchors.playerHorizontalOffsetDropdown,
+        "Player X offset:",
+        columnWidth,
+        BuffSettingsWindow.settings.playerBuffHorizontalOffset,
+        offsetXMin,
+        offsetXMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.playerBuffHorizontalOffset = value
+            BuffSettingsWindow.SaveSettings()
+        end
+    )
+
+    local offsetYMin, offsetYMax = GetOptionBounds(buffsYOffsetOptions)
+    local _, playerVerticalOffsetLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.playerVerticalOffsetDropdown,
-        "P Offset:",
-        62,
-        buffsYOffsetOptions,
-        offsetIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.playerBuffVerticalOffset = tonumber(selectedValue)
+        "Player Y offset:",
+        columnWidth,
+        BuffSettingsWindow.settings.playerBuffVerticalOffset,
+        offsetYMin,
+        offsetYMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.playerBuffVerticalOffset = value
             BuffSettingsWindow.SaveSettings()
-        end,
-        "Vertical offset for player buffs positioning"
+        end
     )
 
-    -- Create target vertical offset dropdown
-    local targetOffsetIndex = 6 -- Default to "-38"
-    -- Set from loaded settings
-    for i, offset in ipairs(buffsYOffsetOptions) do
-        if tonumber(offset) == BuffSettingsWindow.settings.targetBuffVerticalOffset then
-            targetOffsetIndex = i
-            break
+    local _, targetHorizontalOffsetLabel = helpers.CreateSliderWithLabel(
+        buffSelectionWindow,
+        anchors.targetHorizontalOffsetDropdown,
+        "Target X offset:",
+        columnWidth,
+        BuffSettingsWindow.settings.targetBuffHorizontalOffset,
+        offsetXMin,
+        offsetXMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.targetBuffHorizontalOffset = value
+            BuffSettingsWindow.SaveSettings()
         end
-    end
-    local targetVerticalOffsetDropdown, targetVerticalOffsetLabel = helpers.CreateDropdownWithLabel(
+    )
+
+    local _, targetVerticalOffsetLabel = helpers.CreateSliderWithLabel(
         buffSelectionWindow,
         anchors.targetVerticalOffsetDropdown,
-        "T Offset:",
-        62,
-        buffsYOffsetOptions,
-        targetOffsetIndex,
-        function(selectedIndex, selectedValue)
-            BuffSettingsWindow.settings.targetBuffVerticalOffset = tonumber(selectedValue)
+        "Target Y offset:",
+        columnWidth,
+        BuffSettingsWindow.settings.targetBuffVerticalOffset,
+        offsetYMin,
+        offsetYMax,
+        1,
+        function(value)
+            BuffSettingsWindow.settings.targetBuffVerticalOffset = value
             BuffSettingsWindow.SaveSettings()
-        end,
-        "Vertical offset for target buffs positioning"
+        end
     )
 
-       --================= Create category dropdownn =================--
-    local categoryDropdownTooltip = "'All static buffs' - all buffs in the game (many are outdated) \n" ..
-        "'All logged buffs' - buffs collected by logged \n" ..
-        "'Watched buffs' - buffs that are watched on (Player/Target)"
+    local playerAboveUnitFrameCheckbox, playerAboveUnitFrameLabel = helpers.CreateInlineCheckboxWithLabel(
+        buffSelectionWindow,
+        anchors.playerAboveUnitFrameCheckbox,
+        "Show above player frame:",
+        "Yes",
+        BuffSettingsWindow.settings.showAbovePlayerUnitFrame,
+        function(isChecked)
+            BuffSettingsWindow.settings.showAbovePlayerUnitFrame = isChecked
+            BuffSettingsWindow.SaveSettings()
+        end
+    )
+    playerAboveUnitFrameCheckbox:RemoveAllAnchors()
+    playerAboveUnitFrameCheckbox:AddAnchor("TOP", playerAboveUnitFrameLabel, "BOTTOM", 0, 8)
 
+    local targetAboveUnitFrameCheckbox, targetAboveUnitFrameLabel = helpers.CreateInlineCheckboxWithLabel(
+        buffSelectionWindow,
+        anchors.targetAboveUnitFrameCheckbox,
+        "Show above target frame:",
+        "Yes",
+        BuffSettingsWindow.settings.showAboveTargetUnitFrame,
+        function(isChecked)
+            BuffSettingsWindow.settings.showAboveTargetUnitFrame = isChecked
+            BuffSettingsWindow.SaveSettings()
+        end
+    )
+    targetAboveUnitFrameCheckbox:RemoveAllAnchors()
+    targetAboveUnitFrameCheckbox:AddAnchor("TOP", targetAboveUnitFrameLabel, "BOTTOM", 0, 8)
+
+       --================= Create category dropdownn =================--
     local categoryLabel
     categoryDropdown, categoryLabel = helpers.CreateDropdownWithLabel(
         buffSelectionWindow,
         anchors.categoryDropdown,
         "Buff category:",
-        140,
+        160,
         categories,
         currentCategory, -- "Watched Buffs" as default
         function(selectedIndex, selectedValue)
@@ -913,8 +1017,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
                 fillBuffData(buffScrollList, 1, searchEditBox:GetText())
             end
             categoryDropdown:UpdateTextColor(selectedIndex)
-        end,
-        categoryDropdownTooltip
+        end
     )
     function categoryDropdown:UpdateTextColor(selectedIndex)
         if selectedIndex == CATEGORY_TYPE_ALL then
@@ -934,7 +1037,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         buffSelectionWindow,
         anchors.searchEditBox,
         "Search:",
-        240,        -- width
+        340,        -- width
         28,         -- height
         "",         -- defaultText
         false,      -- isDigitOnly
@@ -992,7 +1095,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     
 
     --================= Create the buff scroll lis =================--
-    buffScrollListWidth = 470
+    buffScrollListWidth = 564
     buffScrollList = W_CTRL.CreatePageScrollListCtrl("buffScrollList", buffSelectionWindow)
     buffScrollList:SetWidth(buffScrollListWidth)
     local scrlAnchor = anchors.buffScrollList
@@ -1025,14 +1128,6 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     recordAllButton:SetAutoResize(false)
     recordAllButton:SetExtent(90, 28)
     recordAllButton.style:SetFontSize(14)
-
-    helpers.createTooltip(
-        "recordAllButtonTooltip",
-        recordAllButton,
-        "This will start logging all buffs/debufs that are active on the player or target(s) during reccording time. \n" ..
-        "So later on you can use them to add to your 'Watched buffs', \n" ..
-        "You could find them under the 'All logged buffs' section of 'Buff category'"
-    )
 
     function recordAllButton:UpdateTextColor(color)
         local color = color or FONT_COLOR.DEFAULT
