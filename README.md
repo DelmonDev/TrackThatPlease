@@ -7,11 +7,7 @@ expiring-soon blink.
 Pick what matters to you out of the full game index, and stop squinting at the
 default frames to find out whether your buff is still up.
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/0c02eae3-9c16-486b-8ec1-bef2c5f38343"
-       width="470"
-       alt="The TrackThatPlease settings window, showing the Display, Timers and Position, Player Bar and Tracking panels above the buff list">
-</p>
+![The TrackThatPlease settings window, showing the Display, Timers and Position, Player Bar and Tracking panels above the buff list](https://github.com/user-attachments/assets/0c02eae3-9c16-486b-8ec1-bef2c5f38343)
 
 ---
 
@@ -31,11 +27,7 @@ Any of these:
 - the **addon manager's** settings button
 - type **`ttp`** in chat
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/dbd031e9-f91e-4090-961c-261d109810e7"
-       width="450"
-       alt="The in-game ESC menu with the Addon Options panel open beside it, listing TrackThatPlease among the installed addons">
-</p>
+![The in-game ESC menu with the Addon Options panel open beside it, listing TrackThatPlease among the installed addons](https://github.com/user-attachments/assets/dbd031e9-f91e-4090-961c-261d109810e7)
 
 ---
 
@@ -43,9 +35,7 @@ Any of these:
 
 The **TRACKING** panel drives everything.
 
-<img src="https://github.com/user-attachments/assets/1069b56e-39dd-43f8-8890-4661f378228c"
-     width="493"
-     alt="The TRACKING panel: Track type and Buff category dropdowns, a search box, and the list scope and sharing buttons">
+![The TRACKING panel: Track type and Buff category dropdowns, a search box, and the list scope and sharing buttons](https://github.com/user-attachments/assets/1069b56e-39dd-43f8-8890-4661f378228c)
 
 | Control | What it does |
 |---|---|
@@ -89,9 +79,7 @@ it overwrites a list that may hold hundreds of buffs.
 
 ## The player bar
 
-<img src="https://github.com/user-attachments/assets/f478fe4e-dad0-4231-80e1-9c71f9c6a143"
-     width="492"
-     alt="The PLAYER BAR panel, with the Position button and the Nametag toggle beside it">
+![The PLAYER BAR panel, with the Position button and the Nametag toggle beside it](https://github.com/user-attachments/assets/f478fe4e-dad0-4231-80e1-9c71f9c6a143)
 
 Two positions, cycled with the **Position** button:
 
