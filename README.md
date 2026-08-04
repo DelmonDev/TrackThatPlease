@@ -22,8 +22,6 @@ default frames to find out whether your buff is still up.
 Any of these:
 
 - **ESC menu** → **Addon Options** → **TrackThatPlease**
-
-  <img width="514" height="337" alt="Image" src="https://github.com/user-attachments/assets/dbd031e9-f91e-4090-961c-261d109810e7" />
 - the **addon manager's** settings button
 - type **`ttp`** in chat
 
