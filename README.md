@@ -107,7 +107,7 @@ tell you it is about to drop. Offsets move each bar up or down independently.
 ## Credits
 
     Dehling (Delmon)
-      With idea implementation from Myke
+      With idea implementation from Myke and Fortuno
 
 This addon is free. If you find it useful, in-game donations are appreciated but
 never expected — **character: Dehling**.
