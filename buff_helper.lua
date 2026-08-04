@@ -3,6 +3,10 @@ local staticBuffList  = require("TrackThatPlease/static_buff_list")
 local BuffsLogger
 local ALL_BUFFS = staticBuffList.ALL_BUFFS
 local ddsData = staticBuffList.ddsData
+-- "Buff"/"Debuff" per id, from the full client dump. The live isBuff flag only
+-- exists for a buff actually on a unit, so this is the only way to tell them
+-- apart while browsing the index.
+local category = staticBuffList.category or {}
 local BuffHelper = {}
 
 -- This function returns the buff info given a buff ID
@@ -67,7 +71,8 @@ function BuffHelper.InitializeAllBuffs(buffsLogger)
             id = id,
             name = name,
             iconPath = iconPath,
-            description = description
+            description = description,
+            category = category[id]
         }
         
         table.insert(filteredBuffsArr, entry)
@@ -82,9 +87,10 @@ function BuffHelper.InitializeAllBuffs(buffsLogger)
 
                 local entry = {
                     id = idFromLogger,
-                    name = loggerBuff.name, 
+                    name = loggerBuff.name,
                     iconPath = loggerBuff.iconPath,
-                    description = loggerBuff.description 
+                    description = loggerBuff.description,
+                    category = category[idFromLogger] -- nil: not in the dump
                 }
                 table.insert(filteredBuffsArr, entry)
                 idIndex[idFromLogger] = entry

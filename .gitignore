@@ -1,0 +1,18 @@
+# Windows / editor junk
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
+
+# Addon runtime output
+*.log
+settings.lua
+buff_logs/
+watchlist.txt
+watchlist_previous.txt
+watchlist_export.txt
+anchor_trace*.txt
+zoom_trace.txt
+static_buff_list.lua.backup

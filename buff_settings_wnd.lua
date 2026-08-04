@@ -5,10 +5,266 @@ local BuffsLogger
 
 local BuffSettingsWindow = {}
 BuffSettingsWindow.settings = {}
--- Last element of maxBuffsOptions must be equal to this
-BuffSettingsWindow.MAX_BUFFS_COUNT = 25 
+-- Upper bound of the "Max buffs" slider and the number of icon slots created
+BuffSettingsWindow.MAX_BUFFS_COUNT = 13
+-- Single source for the version: main.lua's addon table and the settings-window
+-- footer both read this, so they cannot disagree.
+BuffSettingsWindow.ADDON_VERSION = "3.0"
+-- Blinking "recording" indicator shown left of the logging button
+local RECORDING_ICON_PATH = "../Addon/TrackThatPlease/icons/rec-button.png"
 
-local serializedSettings = {}
+-- Settings storage (schema v2)
+--
+--   root = {
+--     schemaVersion = 2,
+--     enabled       = true,   -- owned by the addon manager
+--     hudSession    = N,      -- owned by main.lua
+--     global     = { <all display settings>, playerWatchedBuffs, targetWatchedBuffs },
+--     characters = { ["name"] = { useCharacterBuffs, playerWatchedBuffs, targetWatchedBuffs } },
+--   }
+--
+-- Display settings are always global. Watched lists come from `global` unless the
+-- character has opted into its own lists via useCharacterBuffs.
+local SCHEMA_VERSION = 2
+
+local settingsRoot = {}
+local globalSettings = {}
+local characterSettings = {}
+local currentCharacterKey = "unknown"
+-- True while we hold a table that api.GetSettings did not give us, so writes
+-- would not persist. ensureRoot folds it into the real table once one appears.
+local rootIsDetached = false
+-- Attempts made to resolve the character name after load (see retryCharacterKeyLoad)
+local characterKeyRetries = 0
+
+-- Root keys that are not display settings and must survive migration untouched
+local RESERVED_ROOT_KEYS = {
+    enabled = true,        -- read by the addon manager to enable/disable the addon
+    hudSession = true,     -- /reload stale-HUD counter, owned by main.lua
+    schemaVersion = true,
+    global = true,
+    characters = true,
+    legacyBackupV1 = true,
+    infoCardSeen = true,   -- one-time welcome card; per install, not per character
+}
+
+-- v0 keys that no code reads any more; dropped during migration
+local LEGACY_DEAD_KEYS = {
+    playerBuffHorizontalOffset = true,
+    targetBuffHorizontalOffset = true,
+    showAbovePlayerUnitFrame = true,
+    showAboveTargetUnitFrame = true,
+    buffBlinkSpeed = true,
+}
+
+-- Ranges enforced on load. Old files predate the current limits (a v0 file can
+-- carry maxBuffsShown = 25 while only MAX_BUFFS_COUNT icon slots exist, which
+-- would index past the end of the icon arrays in main.lua).
+local SETTING_CLAMPS = {
+    fontSize = { 10, 36 },
+    iconSize = { 25, 58 },
+    iconSpacing = { 1, 10 },
+    maxBuffsShown = { 3, BuffSettingsWindow.MAX_BUFFS_COUNT },
+    buffWarnTime = { 0, 10000 },
+    debuffWarnTime = { 0, 10000 },
+    playerBuffVerticalOffset = { -60, -20 },
+    targetBuffVerticalOffset = { -60, -20 },
+    UIScale = { 0.5, 3 },
+}
+
+local function clampNumber(value, minValue, maxValue)
+    if value < minValue then return minValue end
+    if value > maxValue then return maxValue end
+    return value
+end
+
+-- Keeps a saved widget position reachable. Old files store floats and can pin a
+-- widget to the very screen edge (btnSettingsPos = {1676.29, -0.0101827}), which
+-- leaves the settings button unclickable.
+local function clampPosition(pos, widgetWidth, widgetHeight)
+    local screenWidth = api.Interface:GetScreenWidth()
+    local screenHeight = api.Interface:GetScreenHeight()
+    local x = tonumber(pos and pos[1]) or 0
+    local y = tonumber(pos and pos[2]) or 0
+    x = clampNumber(x, 0, math.max(0, screenWidth - widgetWidth))
+    y = clampNumber(y, 0, math.max(0, screenHeight - widgetHeight))
+    return { math.floor(x + 0.5), math.floor(y + 0.5) }
+end
+
+local function getCurrentCharacterKey()
+    local playerId = api.Unit:GetUnitId("player")
+    local playerInfo = api.Unit:GetUnitInfoById(playerId)
+    local playerName = playerInfo and playerInfo.name or "Unknown"
+    if type(playerName) ~= "string" or playerName == "" then
+        playerName = "unknown"
+    end
+    return string.lower(playerName)
+end
+
+-- v0 stored settings flat at the root; v1 added per-character buckets alongside
+-- them. A character bucket is a hash (string keys); every v0 table-valued
+-- setting is an array (btnSettingsPos, the watched-buff lists).
+local function isCharacterBucket(value)
+    if type(value) ~= "table" then return false end
+    for key in pairs(value) do
+        if type(key) == "string" then return true end
+    end
+    return false
+end
+
+-- Migrates v0 (flat) and v1 (per-character) layouts to v2. Runs once, guarded by
+-- schemaVersion. The structural half does not need the character name; only the
+-- choice of global-settings baseline does, and that falls back when unresolved.
+local function migrateSettings(root)
+    if type(root) ~= "table" then return end
+    if tonumber(root.schemaVersion) == SCHEMA_VERSION then return end
+
+    -- One-time recoverable snapshot of the pre-migration shape
+    if root.legacyBackupV1 == nil then
+        local backup = {}
+        for key, value in pairs(root) do
+            backup[key] = value
+        end
+        root.legacyBackupV1 = backup
+    end
+
+    local flatSettings = {}
+    local flatPlayerBuffs, flatTargetBuffs
+    local charBuckets = {}
+
+    -- Clearing an existing key during pairs() is allowed in Lua; adding is not.
+    for key, value in pairs(root) do
+        if RESERVED_ROOT_KEYS[key] then -- leave alone
+        elseif LEGACY_DEAD_KEYS[key] then
+            root[key] = nil
+        elseif key == "playerWatchedBuffs" then
+            flatPlayerBuffs = value
+            root[key] = nil
+        elseif key == "targetWatchedBuffs" then
+            flatTargetBuffs = value
+            root[key] = nil
+        elseif isCharacterBucket(value) then
+            charBuckets[key] = value
+            root[key] = nil
+        else
+            flatSettings[key] = value
+            root[key] = nil
+        end
+    end
+
+    -- Global settings baseline, lowest priority first: the flat v0 values, then
+    -- the misfiled "unknown" bucket, then the active character's own bucket.
+    local global = {}
+    local function layer(bucket)
+        if type(bucket) ~= "table" then return end
+        for key, value in pairs(bucket) do
+            if key ~= "playerWatchedBuffs" and key ~= "targetWatchedBuffs"
+                and key ~= "useCharacterBuffs" and not LEGACY_DEAD_KEYS[key] then
+                global[key] = value
+            end
+        end
+    end
+    layer(flatSettings)
+    layer(charBuckets["unknown"])
+
+    local activeKey = getCurrentCharacterKey()
+    if charBuckets[activeKey] then
+        layer(charBuckets[activeKey])
+    else
+        -- Name not resolved yet: only unambiguous when a single real bucket exists
+        local onlyKey, count = nil, 0
+        for key in pairs(charBuckets) do
+            if key ~= "unknown" then
+                onlyKey = key
+                count = count + 1
+            end
+        end
+        if count == 1 then layer(charBuckets[onlyKey]) end
+    end
+
+    -- The v0 root lists were the shared, pre-character-era lists
+    global.playerWatchedBuffs = flatPlayerBuffs or {}
+    global.targetWatchedBuffs = flatTargetBuffs or {}
+
+    -- Existing characters keep their own lists rather than being forced onto the
+    -- new global default; the toggle lets them opt in later without data loss.
+    local characters = {}
+    for name, bucket in pairs(charBuckets) do
+        if name ~= "unknown" then
+            characters[name] = {
+                useCharacterBuffs = true,
+                playerWatchedBuffs = bucket.playerWatchedBuffs or {},
+                targetWatchedBuffs = bucket.targetWatchedBuffs or {},
+            }
+        end
+    end
+
+    root.global = global
+    root.characters = characters
+    root.schemaVersion = SCHEMA_VERSION
+    api.Log:Info("TrackThatPlease: settings migrated to schema v" .. SCHEMA_VERSION)
+end
+
+-- api.GetSettings hands back a live reference that api.SaveSettings serialises.
+-- On a first run it can be nil, in which case we work on a detached table and
+-- fold it into the real one as soon as the API produces it.
+local function ensureRoot()
+    local fetched = api.GetSettings("TrackThatPlease")
+    if type(fetched) == "table" then
+        if rootIsDetached and type(settingsRoot) == "table" and settingsRoot ~= fetched then
+            for key, value in pairs(settingsRoot) do
+                if fetched[key] == nil then fetched[key] = value end
+            end
+        end
+        settingsRoot = fetched
+        rootIsDetached = false
+    elseif type(settingsRoot) ~= "table" or not rootIsDetached then
+        settingsRoot = {}
+        rootIsDetached = true
+    end
+    return settingsRoot
+end
+
+local function ensureBuckets()
+    local root = ensureRoot()
+    migrateSettings(root)
+
+    if type(root.global) ~= "table" then root.global = {} end
+    globalSettings = root.global
+
+    -- "experimental" was a third player-bar mode before it became the Nametag
+    -- toggle. Anyone who had it selected wanted nameplate compensation, so carry
+    -- that across rather than dropping them back to plain Above Head. Idempotent:
+    -- once it runs the stored mode is "head", so it cannot fire twice.
+    if globalSettings.playerBarMode == "experimental" then
+        globalSettings.playerBarMode = "head"
+        globalSettings.nametagEnabled = true
+    end
+    globalSettings.smoothingEnabled = nil -- smoothing was removed
+
+    if type(root.characters) ~= "table" then root.characters = {} end
+    currentCharacterKey = getCurrentCharacterKey()
+    if currentCharacterKey ~= "unknown" then
+        if type(root.characters[currentCharacterKey]) ~= "table" then
+            root.characters[currentCharacterKey] = { useCharacterBuffs = false }
+        end
+        characterSettings = root.characters[currentCharacterKey]
+    else
+        -- Never persist an "unknown" bucket; work on a scratch table until the
+        -- real character name resolves.
+        characterSettings = { useCharacterBuffs = false }
+    end
+    return root
+end
+
+local function usesCharacterBuffs()
+    return characterSettings.useCharacterBuffs == true
+end
+
+local function getBuffBucket()
+    if usesCharacterBuffs() then return characterSettings end
+    return globalSettings
+end
 
 -- UI elements
 local buffSelectionWindow
@@ -25,38 +281,20 @@ local playerWatchedBuffs = {}
 local targetWatchedBuffs = {}
 
 local filteredBuffs = {}
-local currentTrackType = 1  -- 1 for Player, 2 for Target
+local currentTrackType = 1  -- 1 = Player, 2 = Target, 3 = Both
 local isSelectedAll = false
 
-local function BuildNumericOptions(minValue, maxValue, step)
-    local options = {}
-    local value = minValue
-
-    while value <= maxValue do
-        table.insert(options, tostring(value))
-        value = value + step
-    end
-
-    return options
-end
-
-local maxBuffsOptions = BuildNumericOptions(1, BuffSettingsWindow.MAX_BUFFS_COUNT, 1)
-local iconSpacingOptions = BuildNumericOptions(0, 20, 1)
-local iconSizeOptions = BuildNumericOptions(16, 64, 1)
-local fontSizeOptions = BuildNumericOptions(8, 40, 1)
-local warnTimeOptions = BuildNumericOptions(0.5, 30, 0.5)
-local buffsXOffsetOptions = BuildNumericOptions(-300, 300, 1)
-local buffsYOffsetOptions = BuildNumericOptions(-200, 200, 1)
-local smoothingSpeedOptions = BuildNumericOptions(0, 40, 1)
-local blinkSpeedOptions = BuildNumericOptions(0.5, 5, 0.5)
 local buffScrollListWidth
 
 -- Scroll and pagination
 local pageSize = 50
 local categories = {"All static buffs", "All logged buffs", "Watched buffs"}
-local trackTypes = {"Player", "Target"}
+local trackTypes = {"Player", "Target", "Both"}
 local TRACK_TYPE_PLAYER = 1
 local TRACK_TYPE_TARGET = 2
+-- "Both" keeps the two lists separate on disk and applies every action to each
+-- of them; a buff counts as watched only when it is on both.
+local TRACK_TYPE_BOTH = 3
 -- Category types
 local CATEGORY_TYPE_ALL = 1
 local CATEGORY_TYPE_LOGGED = 2
@@ -73,79 +311,45 @@ local function DeserializeNumber(str)
     return tonumber(str)
 end
 
-local function GetOptionBounds(options)
-    local minValue = tonumber(options[1])
-    local maxValue = tonumber(options[#options])
-    return minValue, maxValue
-end
-
-local function NormalizeWarnTimeMilliseconds(value, defaultValue)
-    local numericValue = tonumber(value) or defaultValue or 1000
-    local normalizedHalfSeconds = math.floor((numericValue / 500) + 0.5)
-
-    if normalizedHalfSeconds < 1 then
-        normalizedHalfSeconds = 1
-    elseif normalizedHalfSeconds > 60 then
-        normalizedHalfSeconds = 60
-    end
-
-    return normalizedHalfSeconds * 500
-end
-
-local function PrintBuffWatchWindowSettings()
-    api.Log:Info("|cFF00FFFF====== serializedSettings ======|r")
-    
-    if not serializedSettings then
-        api.Log:Info("|cFFFF6347serializedSettings is nil!|r")
-    else
-        for key, value in pairs(serializedSettings) do
-            if type(value) == "table" then
-                local count = #value
-                api.Log:Info(string.format("|cFFFFD700%s|r: |cFF98FB98(array with %d items)|r", key, count))
-                
-                local shown = 0
-                for k, v in pairs(value) do
-                    if shown < 3 then
-                        api.Log:Info(string.format("  |cFFDDA0DD[%s]|r = |cFFFFFFFF%s|r", tostring(k), tostring(v)))
-                        shown = shown + 1
-                    else
-                        api.Log:Info("  |cFF87CEEB... (more items)|r")
-                        break
-                    end
-                end
-            else
-                api.Log:Info(string.format("|cFFFFD700%s|r: |cFFFFFFFF%s|r", key, tostring(value)))
-            end
-        end
-    end
-    
-    api.Log:Info("|cFF00FFFF=== End Debug Output ===|r")
-end
 
 --============================ ### Settings section ### ==============================--
 
 function BuffSettingsWindow.SaveSettings()
-    -- Convert hash tables to serialized arrays for storage
-    local serializedPlayerBuffs = {}
-    local serializedTargetBuffs = {}
-    
-    for buffId, _ in pairs(playerWatchedBuffs) do
-        table.insert(serializedPlayerBuffs, SerializeNumber(buffId))
-    end
-    
-    for buffId, _ in pairs(targetWatchedBuffs) do
-        table.insert(serializedTargetBuffs, SerializeNumber(buffId))
+    -- Convert hash tables to serialized arrays for storage. Tracked and merely
+    -- listed buffs are stored separately so that unticking one survives a reload
+    -- without it reappearing as tracked.
+    local serializedPlayerBuffs, serializedPlayerDisabled = {}, {}
+    local serializedTargetBuffs, serializedTargetDisabled = {}, {}
+
+    for buffId, enabled in pairs(playerWatchedBuffs) do
+        table.insert(enabled and serializedPlayerBuffs or serializedPlayerDisabled,
+            SerializeNumber(buffId))
     end
 
-    -- Save serialized data to disk
-    serializedSettings.playerWatchedBuffs = serializedPlayerBuffs
-    serializedSettings.targetWatchedBuffs = serializedTargetBuffs
-    -- All others settings
-    for key, value in pairs(BuffSettingsWindow.settings) do
-        serializedSettings[key] = value
+    for buffId, enabled in pairs(targetWatchedBuffs) do
+        table.insert(enabled and serializedTargetBuffs or serializedTargetDisabled,
+            SerializeNumber(buffId))
     end
-    
-    --PrintBuffWatchWindowSettings()
+
+    ensureBuckets()
+
+    -- Display and behaviour settings are shared by every character
+    for key, value in pairs(BuffSettingsWindow.settings) do
+        globalSettings[key] = value
+    end
+
+    -- Until the character name resolves we cannot know which bucket owns the
+    -- lists, and writing them to global would be silently undone once it does.
+    -- Settings still save; only the lists wait. Once the retries are exhausted
+    -- we stop waiting, otherwise a name that never resolves could never save.
+    if currentCharacterKey ~= "unknown" or characterKeyRetries >= 10 then
+        local bucket = getBuffBucket()
+        bucket.playerWatchedBuffs = serializedPlayerBuffs
+        bucket.targetWatchedBuffs = serializedTargetBuffs
+        bucket.playerDisabledBuffs = serializedPlayerDisabled
+        bucket.targetDisabledBuffs = serializedTargetDisabled
+    end
+
 
     -- Safely Save settings to file
     pcall(function()
@@ -153,109 +357,378 @@ function BuffSettingsWindow.SaveSettings()
     end)
 end
 
-local function loadSettings()
-    api.Log:Err("Start Loading settings for TrackThatPlease")
-    local defaultX = (api.Interface:GetScreenWidth() / 2) -42 -- Center button (42 is half of button width)
-    local defaultSettings = {
+-- Slider drags fire a change per tick; debounce the full settings flush
+local savePending = false
+local function queueSave()
+    if savePending then return end
+    savePending = true
+    api:DoIn(600, function()
+        savePending = false
+        BuffSettingsWindow.SaveSettings()
+    end)
+end
+
+local loadSettings
+
+-- Assigned in Initialize, once the scroll list and its widgets exist. Lets the
+-- character-key retry below refresh the UI without forward-declaring every widget.
+local refreshWatchedUI = function() end
+local refreshBuffScopeButton = function() end
+-- Custom pager (the engine page control is hidden); assigned in Initialize
+local refreshPager = function() end
+local currentTotalPages = 1
+
+local function buildDefaultSettings()
+    -- btnSettingsPos is gone: the floating HUD button it positioned was removed in
+    -- favour of the ESC menu entry. Any stale value left in a settings file is
+    -- simply ignored.
+    return {
         UIScale = api.Interface:GetUIScale(),
-        fontSize = 12,
-        targetBuffHorizontalOffset = 0,
-        targetBuffVerticalOffset = -38,
-        playerBuffHorizontalOffset = 0,
-        playerBuffVerticalOffset = -38,
-        showAbovePlayerUnitFrame = false,
-        showAboveTargetUnitFrame = false,
-        iconSize = 34,
-        iconSpacing = 3,
-        maxBuffsShown = 5,
-        debuffWarnTime = 2000,
-        buffWarnTime = 3000,
-        smoothingSpeed = 8,
-        buffBlinkSpeed = 5,
+        fontSize = 16,
+        targetBuffVerticalOffset = -46,
+        playerBuffVerticalOffset = -46,
+        iconSize = 30,
+        iconSpacing = 5,
+        maxBuffsShown = 10,
+        debuffWarnTime = 7000,
+        buffWarnTime = 7000,
         shouldShowStacks = true,
-        btnSettingsPos = { defaultX, 25 },
+        -- Whether the player has their own nameplate turned on. With it on the
+        -- game's overhead anchor wanders and the bar has to compensate; with it
+        -- off, plain Above Head tracking is already correct.
+        --
+        -- On by default because most players run with their nameplate showing.
+        -- Anyone who does not should turn it off: it corrects a wander that is
+        -- not there for them, and leaving it on is a small regression.
+        nametagEnabled = true,
+        playerBarMode = "head", -- "head" follows the character; "fixed" pins to screen
+        playerBarPos = { math.floor(api.Interface:GetScreenWidth() / 2 - 80),
+                         math.floor(api.Interface:GetScreenHeight() * 0.6) },
     }
-    --[[ -- Expected keys
-        local allowedKeys = {}
-        for key, _ in pairs(defaultSettings) do
-            allowedKeys[key] = true
-        end
-        allowedKeys.playerWatchedBuffs = true
-        allowedKeys.targetWatchedBuffs = true
-        allowedKeys.enabled = true -- VERY IMPORTANT KEY 
-    --]]
+end
 
-    -- Load Settings
-    serializedSettings = api.GetSettings("TrackThatPlease") or {}
-    --[[    -- Clear unexpected keys
-            for key in pairs(serializedSettings) do
-            if not allowedKeys[key] then
-                serializedSettings[key] = nil
-            end
-        end 
-    --]]
-
-    local function ensureType(value, defaultValue)
-        if type(defaultValue) == "number" then
-            -- numbers
-            return tonumber(value) or defaultValue
-        elseif type(defaultValue) == "boolean" then
-            -- boolean
-            if type(value) == "boolean" then return value end
-            if type(value) == "string" then return value == "true" end
-            return defaultValue
-        else
-            -- string and tables
-            return type(value) == type(defaultValue) and value or defaultValue
-        end
-    end
-    
-    -- Safe initialization of settings
-    BuffSettingsWindow.settings = {}
-
-    for k, defaultValue in pairs(defaultSettings) do
-        BuffSettingsWindow.settings[k] = ensureType(serializedSettings[k], defaultValue)
-    end
-
-    BuffSettingsWindow.settings.debuffWarnTime = NormalizeWarnTimeMilliseconds(
-        BuffSettingsWindow.settings.debuffWarnTime,
-        defaultSettings.debuffWarnTime
-    )
-    BuffSettingsWindow.settings.buffWarnTime = NormalizeWarnTimeMilliseconds(
-        BuffSettingsWindow.settings.buffWarnTime,
-        defaultSettings.buffWarnTime
-    )
-
-    serializedSettings.debuffWarnTime = BuffSettingsWindow.settings.debuffWarnTime
-    serializedSettings.buffWarnTime = BuffSettingsWindow.settings.buffWarnTime
-    
-    -- Load player buffs from serialized data
-    local savedPlayerBuffs = serializedSettings.playerWatchedBuffs or {}
-    playerWatchedBuffs = {}
-    for _, idString in ipairs(savedPlayerBuffs) do
-        local buffId = DeserializeNumber(idString)
-        if buffId then
-            playerWatchedBuffs[buffId] = true
-        end
-    end
-    
-    -- Load target buffs from serialized data
-    local savedTargetBuffs = serializedSettings.targetWatchedBuffs or {}
-    targetWatchedBuffs = {}
-    for _, idString in ipairs(savedTargetBuffs) do
-        local buffId = DeserializeNumber(idString)
-        if buffId then
-            targetWatchedBuffs[buffId] = true
-        end
+local function ensureType(value, defaultValue)
+    if type(defaultValue) == "number" then
+        -- numbers
+        return tonumber(value) or defaultValue
+    elseif type(defaultValue) == "boolean" then
+        -- boolean
+        if type(value) == "boolean" then return value end
+        if type(value) == "string" then return value == "true" end
+        return defaultValue
+    else
+        -- string and tables
+        return type(value) == type(defaultValue) and value or defaultValue
     end
 end
+
+local function applyClamps(settings)
+    for key, range in pairs(SETTING_CLAMPS) do
+        if type(settings[key]) == "number" then
+            settings[key] = clampNumber(settings[key], range[1], range[2])
+        end
+    end
+    settings.playerBarPos = clampPosition(settings.playerBarPos, 160, 40)
+end
+
+-- Reads the watched lists out of whichever bucket is active for this character.
+-- Files written before the listed/tracked split simply have no disabled arrays,
+-- so everything in them loads as tracked, exactly as before.
+local function loadWatchedBuffs()
+    local bucket = getBuffBucket()
+
+    local function fill(target, enabledKey, disabledKey)
+        for _, idString in ipairs(bucket[enabledKey] or {}) do
+            local buffId = DeserializeNumber(idString)
+            if buffId then
+                target[buffId] = true
+            end
+        end
+        for _, idString in ipairs(bucket[disabledKey] or {}) do
+            local buffId = DeserializeNumber(idString)
+            if buffId and target[buffId] == nil then
+                target[buffId] = false
+            end
+        end
+    end
+
+    playerWatchedBuffs = {}
+    fill(playerWatchedBuffs, "playerWatchedBuffs", "playerDisabledBuffs")
+
+    targetWatchedBuffs = {}
+    fill(targetWatchedBuffs, "targetWatchedBuffs", "targetDisabledBuffs")
+end
+
+-- Display settings are global, so they load immediately. Only the watched lists
+-- depend on the character name, which is not always resolvable at OnLoad time -
+-- retry until it is, then swap just the lists into place.
+local function retryCharacterKeyLoad()
+    if getCurrentCharacterKey() ~= "unknown" then
+        ensureBuckets()
+        loadWatchedBuffs()
+        refreshBuffScopeButton()
+        refreshWatchedUI()
+    elseif characterKeyRetries < 10 then
+        characterKeyRetries = characterKeyRetries + 1
+        api:DoIn(1000, retryCharacterKeyLoad)
+    end
+end
+
+loadSettings = function()
+    local defaultSettings = buildDefaultSettings()
+
+    ensureBuckets()
+
+    -- Safe initialization of settings
+    BuffSettingsWindow.settings = {}
+    for k, defaultValue in pairs(defaultSettings) do
+        BuffSettingsWindow.settings[k] = ensureType(globalSettings[k], defaultValue)
+    end
+    applyClamps(BuffSettingsWindow.settings)
+
+    loadWatchedBuffs()
+
+    -- Character name not available yet: schedule a reload of the watched lists
+    if currentCharacterKey == "unknown" and characterKeyRetries < 10 then
+        characterKeyRetries = characterKeyRetries + 1
+        api:DoIn(1000, retryCharacterKeyLoad)
+    end
+end
+
+-- Switches this character between the shared global lists and its own. The first
+-- switch to per-character seeds from the global list so nothing visibly changes;
+-- switching back leaves the character list on disk, so the toggle is lossless.
+function BuffSettingsWindow.SetUseCharacterBuffs(useCharacter)
+    ensureBuckets()
+    if currentCharacterKey == "unknown" then return false end
+
+    -- Flush the lists currently in memory to the bucket they came from
+    BuffSettingsWindow.SaveSettings()
+
+    if useCharacter and characterSettings.playerWatchedBuffs == nil
+        and characterSettings.targetWatchedBuffs == nil then
+        for _, key in ipairs({ "playerWatchedBuffs", "targetWatchedBuffs",
+                               "playerDisabledBuffs", "targetDisabledBuffs" }) do
+            local seed = {}
+            for _, id in ipairs(globalSettings[key] or {}) do
+                table.insert(seed, id)
+            end
+            characterSettings[key] = seed
+        end
+    end
+
+    characterSettings.useCharacterBuffs = useCharacter and true or false
+    loadWatchedBuffs()
+    pcall(function() api.SaveSettings() end)
+    return true
+end
+
+-- Replaces the shared global lists with this character's lists, making them the
+-- baseline every other character inherits. Copies the entries rather than sharing
+-- the tables, so later per-character edits do not leak into global.
+-- Returns false if there is no character list to promote.
+function BuffSettingsWindow.PromoteCharacterBuffsToGlobal()
+    ensureBuckets()
+    if currentCharacterKey == "unknown" then return false end
+    if not usesCharacterBuffs() then return false end
+
+    -- Flush what is in memory to the character bucket before copying it out
+    BuffSettingsWindow.SaveSettings()
+
+    for _, key in ipairs({ "playerWatchedBuffs", "targetWatchedBuffs",
+                           "playerDisabledBuffs", "targetDisabledBuffs" }) do
+        local promoted = {}
+        for _, id in ipairs(characterSettings[key] or {}) do
+            table.insert(promoted, id)
+        end
+        globalSettings[key] = promoted
+    end
+
+    pcall(function() api.SaveSettings() end)
+    return true
+end
+
+-- Mirror of PromoteCharacterBuffsToGlobal: overwrites this character's stored
+-- lists with the shared global ones. Entries are copied, not shared by reference.
+-- Returns false if there is no resolved character to copy into.
+function BuffSettingsWindow.CopyGlobalBuffsToCharacter()
+    ensureBuckets()
+    if currentCharacterKey == "unknown" then return false end
+
+    -- Flush what is in memory to whichever bucket currently owns it
+    BuffSettingsWindow.SaveSettings()
+
+    for _, key in ipairs({ "playerWatchedBuffs", "targetWatchedBuffs",
+                           "playerDisabledBuffs", "targetDisabledBuffs" }) do
+        local copied = {}
+        for _, id in ipairs(globalSettings[key] or {}) do
+            table.insert(copied, id)
+        end
+        characterSettings[key] = copied
+    end
+
+    -- Only changes what is on screen if this character reads from its own list
+    if usesCharacterBuffs() then
+        loadWatchedBuffs()
+    end
+
+    pcall(function() api.SaveSettings() end)
+    return true
+end
+
+function BuffSettingsWindow.IsUsingCharacterBuffs()
+    return usesCharacterBuffs()
+end
+
+-- ===== Sharing =====
+-- api.File round-trips plain strings (see util/buff_logger.lua), so the exchange
+-- format is readable text rather than a serialized table - it can be sent as a
+-- file or just pasted into chat:
+--
+--   TTP-WATCHLIST v1
+--   player=14743,715,6601
+--   target=6422,6430
+--
+-- Export and import share one filename so a received list can be dropped in and
+-- imported without renaming. The cost is that exporting overwrites a list someone
+-- sent you, so the previous contents are kept in SHARE_BACKUP_PATH.
+local SHARE_PATH = "TrackThatPlease/watchlist.txt"
+local SHARE_BACKUP_PATH = "TrackThatPlease/watchlist_previous.txt"
+
+BuffSettingsWindow.SHARE_PATH = SHARE_PATH
+BuffSettingsWindow.SHARE_BACKUP_PATH = SHARE_BACKUP_PATH
+
+-- Writes the lists this character is currently using. Returns the two counts,
+-- plus true when an existing different list was moved aside first.
+-- Returns nil if the file could not be written.
+function BuffSettingsWindow.ExportWatchedBuffs()
+    ensureBuckets()
+    BuffSettingsWindow.SaveSettings()
+
+    -- Untracked-but-listed entries travel too, on their own lines, so a shared
+    -- list arrives with the same layout the sender curated.
+    local playerIds, targetIds = {}, {}
+    local playerOff, targetOff = {}, {}
+    for buffId, enabled in pairs(playerWatchedBuffs) do
+        table.insert(enabled and playerIds or playerOff, SerializeNumber(buffId))
+    end
+    for buffId, enabled in pairs(targetWatchedBuffs) do
+        table.insert(enabled and targetIds or targetOff, SerializeNumber(buffId))
+    end
+
+    local content = table.concat({
+        "TTP-WATCHLIST v1",
+        "player=" .. table.concat(playerIds, ","),
+        "target=" .. table.concat(targetIds, ","),
+        "playeroff=" .. table.concat(playerOff, ","),
+        "targetoff=" .. table.concat(targetOff, ","),
+    }, "\n")
+
+    -- Preserve whatever was there, so exporting over a received list is recoverable
+    local backedUp = false
+    local readOk, existing = pcall(function() return api.File:Read(SHARE_PATH) end)
+    if readOk and type(existing) == "string" and existing ~= "" and existing ~= content then
+        backedUp = pcall(function() api.File:Write(SHARE_BACKUP_PATH, existing) end)
+    end
+
+    local ok = pcall(function() api.File:Write(SHARE_PATH, content) end)
+    if not ok then return nil end
+    return #playerIds, #targetIds, backedUp
+end
+
+-- Merges a shared list into the lists this character is using. Additive on
+-- purpose: importing never drops buffs the user already watches. Returns the
+-- number of newly added ids, or nil if the file is missing or unreadable.
+function BuffSettingsWindow.ImportWatchedBuffs()
+    ensureBuckets()
+
+    local ok, data = pcall(function() return api.File:Read(SHARE_PATH) end)
+    if not ok or type(data) ~= "string" or data == "" then return nil end
+
+    local function mergeSection(name, target, enabled)
+        local added = 0
+        local list = data:match(name .. "=([^\n\r]*)")
+        if not list then return 0 end
+        -- Match digit runs rather than splitting on separators: api.File:Write
+        -- serialises the string, so a raw read can leave a trailing escape on the
+        -- line ("...,674\") and splitting would drop the last id of every line.
+        for idString in list:gmatch("%d+") do
+            local buffId = DeserializeNumber(idString)
+            -- Only fill gaps: an entry the user already listed keeps its own
+            -- tracked/untracked state rather than being overwritten by the import.
+            if buffId and target[buffId] == nil then
+                target[buffId] = enabled
+                added = added + 1
+            end
+        end
+        return added
+    end
+
+    local addedPlayer = mergeSection("player", playerWatchedBuffs, true)
+    local addedTarget = mergeSection("target", targetWatchedBuffs, true)
+    addedPlayer = addedPlayer + mergeSection("playeroff", playerWatchedBuffs, false)
+    addedTarget = addedTarget + mergeSection("targetoff", targetWatchedBuffs, false)
+
+    BuffSettingsWindow.SaveSettings()
+    return addedPlayer, addedTarget
+end
+
+function BuffSettingsWindow.GetCharacterKey()
+    return currentCharacterKey
+end
+
+-- The recording indicator lives next to the logging button inside this window;
+-- main.lua owns the blink animation and reaches it through here.
+function BuffSettingsWindow.GetRecordingIcon()
+    return recordAllButton and recordAllButton.recordingIndicationIcon or nil
+end
 --============================ ### End ### ==============================--
+
+--============================ ### Track-type helpers ### ==============================--
+-- Every action in the list obeys the Track type dropdown. Centralised here so the
+-- Player/Target/Both rule is stated once instead of at each of the seven call sites.
+
+-- The watched-buff sets the current track type acts on
+local function activeWatchSets()
+    if currentTrackType == TRACK_TYPE_TARGET then
+        return { targetWatchedBuffs }
+    elseif currentTrackType == TRACK_TYPE_BOTH then
+        return { playerWatchedBuffs, targetWatchedBuffs }
+    end
+    return { playerWatchedBuffs }
+end
+
+-- The watched sets map buffId -> boolean, where the KEY's presence means "on the
+-- list" and the VALUE means "currently tracked". Unchecking a buff sets it to
+-- false and keeps it listed, so it stays in the Watched view ready to be ticked
+-- again; only the row's X button removes the key outright.
+
+-- Under "Both" a buff only reads as watched when it is tracked on both lists, so
+-- a single click can bring a half-watched buff to a consistent state.
+local function isWatchedForCurrentType(buffId)
+    for _, set in ipairs(activeWatchSets()) do
+        if set[buffId] ~= true then return false end
+    end
+    return true
+end
+
+local function setWatchedForCurrentType(buffId, watched)
+    for _, set in ipairs(activeWatchSets()) do
+        set[buffId] = watched and true or false
+    end
+end
+
+-- Drops the buff from the list entirely (the row's X button)
+local function removeFromListForCurrentType(buffId)
+    for _, set in ipairs(activeWatchSets()) do
+        set[buffId] = nil
+    end
+end
 
 --============================ ### Scroll list functions ### ==============================--
 local function updateSelectAllButton()
     if selectAllButton then
-        local watchedBuffs = currentTrackType == TRACK_TYPE_PLAYER and playerWatchedBuffs or targetWatchedBuffs
-        
+
         if #filteredBuffs == 0 then
             selectAllButton:Show(false)
             return
@@ -265,58 +738,56 @@ local function updateSelectAllButton()
 
         -- Check if there are too many buffs (performance protection)
         local tooManyBuffs = #filteredBuffs > 200
-        
+
         if tooManyBuffs then
             -- Disable button when too many buffs
-            selectAllButton:Enable(false)
-            selectAllButton:SetText("Too many buffs")
-            selectAllButton:SetTextColor(0.5, 0.5, 0.5, 1) -- Gray text
+            if selectAllButton.Enable then selectAllButton:Enable(false) end
+            selectAllButton:SetFlatText("Too many buffs")
+            selectAllButton:SetFlatTextColor(0.5, 0.5, 0.5, 1) -- Gray text
         else
             -- Enable button and check selection state
-            selectAllButton:Enable(true)
-            selectAllButton:SetTextColor(unpack(FONT_COLOR.DEFAULT)) -- Normal text color
-            
+            if selectAllButton.Enable then selectAllButton:Enable(true) end
+            selectAllButton:SetFlatTextColor(1, 1, 1, 1) -- Normal text color
+
             local allSelected = false
             if #filteredBuffs > 0 then
-                allSelected = true 
+                allSelected = true
                 for _, buff in ipairs(filteredBuffs) do
-                    if not watchedBuffs[buff.id] then
+                    if not isWatchedForCurrentType(buff.id) then
                         allSelected = false
                         break
                     end
                 end
             end
-            
-            selectAllButton:SetText(allSelected and "Unselect All" or "Select All")
+
+            selectAllButton:SetFlatText(allSelected and "Unselect All" or "Select All")
         end
     end
 end
 
 -- Update the appearance of a buff icon
 local function UpdateBuffSelectedAppearance(subItem, buffId)
-    local isWatched = false
-    
-    if currentTrackType == TRACK_TYPE_PLAYER then -- Player
-        isWatched = BuffSettingsWindow.IsPlayerBuffWatched(buffId)
-    else -- Target
-        isWatched = BuffSettingsWindow.IsTargetBuffWatched(buffId)
-    end
-    
-    if isWatched then
-        subItem.checkmarkIcon:SetCoords(852,49,15,15)
+    if not subItem.checkFill then return end
+    if isWatchedForCurrentType(buffId) then
+        subItem.checkFill:SetColor(0, 0.75, 0.75, 1)      -- cyan accent = tracked
     else
-        subItem.checkmarkIcon:SetCoords(832,49,15,15)
+        subItem.checkFill:SetColor(0.14, 0.14, 0.16, 1)   -- listed but not tracked
     end
-    subItem.checkmarkIcon:Show(true)
 end
 
 local function updatePageCount(totalItems)
     local maxPages = math.ceil(totalItems / pageSize)
+    if maxPages < 1 then maxPages = 1 end
     buffScrollList:SetPageByItemCount(totalItems, pageSize)
     buffScrollList.pageControl:SetPageCount(maxPages)
     if buffScrollList.curPageIdx and buffScrollList.curPageIdx > maxPages then
+        -- Keep the addon's own index in step with the engine's, or the next
+        -- refresh reads the stale one straight back
+        buffScrollList.curPageIdx = maxPages
         buffScrollList:SetCurrentPage(maxPages)
     end
+    currentTotalPages = maxPages
+    refreshPager()
 end
 
 -- Fill buff data for the scroll list
@@ -365,11 +836,18 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
             addBuff(buff)
         end
     elseif currentCategory == CATEGORY_TYPE_WATCHED then
-        local watchedBuffs = currentTrackType == TRACK_TYPE_PLAYER and playerWatchedBuffs or targetWatchedBuffs
-        for buffId, _ in pairs(watchedBuffs) do
-            local buff = BuffList.AllBuffsIndex[buffId]
-            if buff then
-                addBuff(buff)
+        -- Under "Both" this is the union of the two lists, so a buff watched on
+        -- only one of them stays visible and can still be removed.
+        local seen = {}
+        for _, set in ipairs(activeWatchSets()) do
+            for buffId, _ in pairs(set) do
+                if not seen[buffId] then
+                    seen[buffId] = true
+                    local buff = BuffList.AllBuffsIndex[buffId]
+                    if buff then
+                        addBuff(buff)
+                    end
+                end
             end
         end
     elseif currentCategory == CATEGORY_TYPE_LOGGED then
@@ -380,6 +858,20 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
         end
     end
     
+    -- Re-clamp the page against the list that actually came back. Callers that
+    -- rebuild the list - switching category, searching, changing track type -
+    -- pass page 1, but curPageIdx is the addon's own field and only the pager
+    -- ever wrote it, so it stayed parked on whatever deep page the previous
+    -- category was showing. Every later refresh reads it back (see its callers),
+    -- so a 1-page list viewed after page 5 of the static index came up empty.
+    -- Clamping before updatePageCount also stops it from calling SetCurrentPage,
+    -- which would re-enter this through OnPageChangedProc.
+    local maxPages = math.max(1, math.ceil(#filteredBuffs / pageSize))
+    if pageIndex > maxPages then pageIndex = maxPages end
+    if pageIndex < 1 then pageIndex = 1 end
+    buffScrollList.curPageIdx = pageIndex
+    startingIndex = ((pageIndex - 1) * pageSize) + 1
+
     updatePageCount(#filteredBuffs)
 
     -- Update count label
@@ -413,11 +905,15 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
     for i = startingIndex, math.min(startingIndex + pageSize - 1, #filteredBuffs) do
         local buff = filteredBuffs[i]
         if buff then
+            -- The logged category yields entries straight from the logger file,
+            -- which carries no classification, so fall back to the index for it.
+            local indexed = BuffList.AllBuffsIndex and BuffList.AllBuffsIndex[buff.id]
             local buffData = {
                 id = buff.id,
                 name = buff.name,
                 iconPath = buff.iconPath,
                 description = buff.description,
+                category = buff.category or (indexed and indexed.category),
                 isViewData = true,
                 isAbstention = false
             }
@@ -435,13 +931,34 @@ local function DataSetFunc(subItem, data, setValue)
         subItem.description = data.description
 
         local formattedText = string.format(
-            "%s |cFFFFE4B5[%d]|r", 
+            "%s |cFFFFE4B5[%d]|r",
             data.name,
-            data.id 
+            data.id
         )
+
+        -- Buff or debuff, on the icon border. The classification comes from the
+        -- client dump, so it is known for entries that have never been seen in
+        -- play - the live isBuff flag only exists for a buff actually on a unit.
+        -- Same green/red the tracked bar icons use.
+        if subItem.catBorders then
+            local r, g, b, a = 1, 1, 1, 0 -- unclassified: let the skin's frame show
+            if data.category == "Buff" then
+                r, g, b, a = 0.15, 0.85, 0.30, 0.95
+            elseif data.category == "Debuff" then
+                r, g, b, a = 0.90, 0.22, 0.22, 0.95
+            end
+            for _, d in ipairs(subItem.catBorders) do
+                d:SetColor(r, g, b, a)
+            end
+        end
         
         subItem.textbox:SetText(formattedText)
         F_SLOT.SetIconBackGround(subItem.subItemIcon, data.iconPath)
+
+        -- Removing only applies to the curated Watched list (see LayoutSetFunc)
+        if subItem.removeBtn then
+            subItem.removeBtn:Show(currentCategory == CATEGORY_TYPE_WATCHED)
+        end
 
         UpdateBuffSelectedAppearance(subItem, id)
     end
@@ -452,19 +969,54 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
     local rowHeight = 80
     subItem:SetExtent(buffScrollListWidth - 150, rowHeight) 
 
-    -- Add background
-    local background = subItem:CreateImageDrawable(TEXTURE_PATH.HUD, "background")
-    background:SetCoords(453, 145, 230, 23)
-    background:AddAnchor("TOPLEFT", subItem, -70, 4)
-    background:AddAnchor("BOTTOMRIGHT", subItem, -70, 4)
+    -- Row background. The game atlas sprite this used to draw followed whichever
+    -- in-game UI skin the player had selected, so it is replaced by the same flat
+    -- border+fill the panels and buttons use.
+    --
+    -- The old sprite spanned TOPLEFT +4 to BOTTOMRIGHT +4, i.e. the full slot
+    -- height shifted down, which left neighbouring rows touching. Insetting the
+    -- fill top and bottom puts a gap between rows instead: 4px each side, so 8px
+    -- of clear space, which keeps neighbouring icons from crowding each other.
+    local bgBorder = subItem:CreateColorDrawable(0, 0, 0, 0.92, "background")
+    bgBorder:AddAnchor("TOPLEFT", subItem, -70, 4)
+    bgBorder:AddAnchor("BOTTOMRIGHT", subItem, -70, -4)
+    local bgFill = subItem:CreateColorDrawable(0.085, 0.085, 0.10, 0.96, "background")
+    bgFill:AddAnchor("TOPLEFT", subItem, -69, 5)
+    bgFill:AddAnchor("BOTTOMRIGHT", subItem, -71, -5)
 
     -- Icon ----------------------
-    local iconSize = 33
+    -- Sized to leave clearance inside the row slot, and vertically centred: the
+    -- checkmark and the remove button both anchor off this icon, so the old +2
+    -- nudge pushed all three of them below the row's centre line.
+    local iconSize = 30
     local subItemIcon = CreateItemIconButton("subItemIcon", subItem)
     subItemIcon:SetExtent(iconSize, iconSize)
     subItemIcon:Show(true)
     F_SLOT.ApplySlotSkin(subItemIcon, subItemIcon.back, SLOT_STYLE.BUFF)
-    subItemIcon:AddAnchor("LEFT", subItem, 5, 2)
+    subItemIcon:AddAnchor("LEFT", subItem, 5, 0)
+
+    -- Buff/debuff border: four drawables on the overlay layer, each with a
+    -- single anchor and a fixed extent (the construction CreateBuffElement in
+    -- main.lua uses for the tracked bar icons). DataSetFunc sets the colour per
+    -- row; an unclassified row leaves them at alpha 0.
+    --
+    -- Placed ON the icon's outer ring rather than around it. The bar's version
+    -- sits outside its icon, but here the slot skin paints its own pale frame on
+    -- that edge and cannot be recoloured, so ringing the icon left both visible -
+    -- a coloured band around a white one. Covering the edge replaces it instead.
+    local borderSize = 2
+    local function edge(point, w, h)
+        local d = subItemIcon:CreateColorDrawable(1, 1, 1, 0, "overlay")
+        d:SetExtent(w, h)
+        d:AddAnchor(point, subItemIcon, point, 0, 0)
+        return d
+    end
+    subItem.catBorders = {
+        edge("TOPLEFT", iconSize, borderSize),
+        edge("BOTTOMLEFT", iconSize, borderSize),
+        edge("TOPLEFT", borderSize, iconSize),
+        edge("TOPRIGHT", borderSize, iconSize),
+    }
 
     -- Setup tooltip ---------------------------------
     function subItemIcon:OnEnter()
@@ -474,11 +1026,12 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
         -- get back line carriages
         local formattedDescription = string.gsub(subItem.description, "\\n", "\n")
 
-        local posX, posY = api.Input:GetMousePos()
-        api.Interface:SetTooltipOnPos(formattedDescription, subItem.subItemIcon, posX, posY)
+        local PosX, PosY = self:GetOffset()
+        api.Interface:SetTooltipOnPos(formattedDescription, subItem.subItemIcon, PosX, PosY + 5)
     end
     function subItemIcon:OnLeave()
-        api.Interface:SetTooltipOnPos(nil, subItem.subItemIcon, 0, 0)
+        local PosX, PosY = self:GetOffset()
+        api.Interface:SetTooltipOnPos(nil, subItem.subItemIcon, PosX, PosY + 5)
     end
     subItemIcon:SetHandler("OnEnter", subItemIcon.OnEnter)
     subItemIcon:SetHandler("OnLeave", subItemIcon.OnLeave)
@@ -498,12 +1051,16 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
     nameTextbox:SetLineSpace(2)
     subItem.textbox = nameTextbox
 
-    -- checkmark config
-    local checkmarkIcon = subItem:CreateImageDrawable(TEXTURE_PATH.HUD, "overlay")
-    checkmarkIcon:SetExtent(14, 14)
-    checkmarkIcon:AddAnchor("LEFT", subItemIcon, "RIGHT", buffScrollListWidth - 145, 0) 
-    checkmarkIcon:Show(true)
-    subItem.checkmarkIcon = checkmarkIcon
+    -- Tracked indicator. Was a sprite from the game HUD atlas, which changed with
+    -- the player's UI skin; now a flat box whose fill carries the state.
+    -- 1px outline, matching the remove button's border weight
+    local checkBorder = subItem:CreateColorDrawable(0, 0, 0, 0.92, "overlay")
+    checkBorder:SetExtent(14, 14)
+    checkBorder:AddAnchor("LEFT", subItemIcon, "RIGHT", buffScrollListWidth - 145, 0)
+    local checkFill = subItem:CreateColorDrawable(0.14, 0.14, 0.16, 1, "overlay")
+    checkFill:SetExtent(12, 12)
+    checkFill:AddAnchor("LEFT", subItemIcon, "RIGHT", buffScrollListWidth - 144, 0)
+    subItem.checkFill = checkFill
 
     local clickOverlay = subItem:CreateChildWidget("button", "clickOverlay", 0, true)
     clickOverlay:AddAnchor("TOPLEFT", subItem, 45, 0)  -- Відступ 45 пікселів зліва
@@ -513,62 +1070,84 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
         local buffId = subItem.id
         BuffSettingsWindow.ToggleBuffWatch(buffId)
         UpdateBuffSelectedAppearance(subItem, buffId)
-        
-        if currentCategory == CATEGORY_TYPE_WATCHED then
-            local isWatched = false
-            if currentTrackType == TRACK_TYPE_PLAYER then
-                isWatched = BuffSettingsWindow.IsPlayerBuffWatched(buffId)
-            else
-                isWatched = BuffSettingsWindow.IsTargetBuffWatched(buffId)
-            end
-            -- Remove from Whached list if unwatched
-            if not isWatched then
-                fillBuffData(buffScrollList, buffScrollList.curPageIdx or 1, searchEditBox:GetText())
-            else
-                updateSelectAllButton()
-            end
-        else
-            updateSelectAllButton()
-        end
-        
+        -- The row deliberately stays put when unticked, so the buff can be ticked
+        -- again without hunting for it a second time. The X button removes it.
+        updateSelectAllButton()
         BuffSettingsWindow.SaveSettings()
-    end 
+    end
     clickOverlay:SetHandler("OnClick", clickOverlay.OnClick)
+
+    -- Remove-from-list button. Only meaningful in the Watched category: "All
+    -- static buffs" is the immutable index, and the logged list is rebuilt on
+    -- reload, so there is nothing to remove from in either.
+    --
+    -- Positioned just past the checkmark, using the same subItemIcon-relative
+    -- offset the checkmark itself uses. subItem is only
+    -- (buffScrollListWidth - 150) wide while the row's visible content runs past
+    -- it, so anchoring to subItem's right edge lands in dead space; and the
+    -- checkmark is a drawable, which is not a valid anchor target for a widget.
+    local removeBtn = subItem:CreateChildWidget("button", "removeBtn", 0, true)
+    removeBtn:SetExtent(18, 18)
+    removeBtn:AddAnchor("LEFT", subItemIcon, "RIGHT", buffScrollListWidth - 97, 0)
+    removeBtn:SetText("")
+    local removeBorder = removeBtn:CreateColorDrawable(0, 0, 0, 0.92, "background")
+    removeBorder:AddAnchor("TOPLEFT", removeBtn, 0, 0)
+    removeBorder:AddAnchor("BOTTOMRIGHT", removeBtn, 0, 0)
+    local removeFill = removeBtn:CreateColorDrawable(0.38, 0.12, 0.12, 0.95, "background")
+    removeFill:AddAnchor("TOPLEFT", removeBtn, 1, 1)
+    removeFill:AddAnchor("BOTTOMRIGHT", removeBtn, -1, -1)
+    local removeLabel = removeBtn:CreateChildWidget("label", "removeBtnLabel", 0, true)
+    removeLabel:SetExtent(16, 14)
+    removeLabel:AddAnchor("CENTER", removeBtn, 0, 0)
+    removeLabel:SetText("x")
+    removeLabel.style:SetFontSize(13)
+    removeLabel.style:SetAlign(ALIGN.CENTER)
+    removeLabel.style:SetColor(1, 1, 1, 1)
+    removeLabel:Clickable(false)
+    subItem.removeBtn = removeBtn
+    removeBtn:Show(currentCategory == CATEGORY_TYPE_WATCHED)
+
+    function removeBtn:OnClick()
+        local buffId = subItem.id
+        if not buffId then return end
+        removeFromListForCurrentType(buffId)
+        BuffSettingsWindow.SaveSettings()
+        -- This one does re-fill: the entry is gone, so the row must go with it
+        fillBuffData(buffScrollList, buffScrollList.curPageIdx or 1, searchEditBox:GetText())
+    end
+    removeBtn:SetHandler("OnClick", removeBtn.OnClick)
 end
 --============================ ### End ### ==============================--
 
 --============================ ### BuffWatchWindow external functions ### ==============================--
+-- Drop a buff from the list the current track type covers (the row's X button)
+function BuffSettingsWindow.RemoveBuffFromList(buffId)
+    buffId = DeserializeNumber(SerializeNumber(buffId))
+    removeFromListForCurrentType(buffId)
+end
+
 -- Toggle a buff's watched status based on current tracking type
 function BuffSettingsWindow.ToggleBuffWatch(buffId)
     buffId = DeserializeNumber(SerializeNumber(buffId))
-    
-    if currentTrackType == TRACK_TYPE_PLAYER then -- Player
-        BuffSettingsWindow.TogglePlayerBuffWatch(buffId)
-    else -- Target
-        BuffSettingsWindow.ToggleTargetBuffWatch(buffId)
-    end
+
+    -- Under "Both", a buff on only one list is completed onto both by the first
+    -- click; a second click clears it from both.
+    setWatchedForCurrentType(buffId, not isWatchedForCurrentType(buffId))
 end
 
 -- Toggle a player buff's watched status
 function BuffSettingsWindow.TogglePlayerBuffWatch(buffId)
     buffId = DeserializeNumber(SerializeNumber(buffId))
-    
-    if playerWatchedBuffs[buffId] then
-        playerWatchedBuffs[buffId] = nil
-    else
-        playerWatchedBuffs[buffId] = true
-    end
+    -- Untracking keeps the buff on the list (value false) so it stays visible in
+    -- the Watched view; use RemoveBuffFromList to drop it entirely.
+    playerWatchedBuffs[buffId] = playerWatchedBuffs[buffId] ~= true
 end
 
 -- Toggle a target buff's watched status
 function BuffSettingsWindow.ToggleTargetBuffWatch(buffId)
     buffId = DeserializeNumber(SerializeNumber(buffId))
-    
-    if targetWatchedBuffs[buffId] then
-        targetWatchedBuffs[buffId] = nil
-    else
-        targetWatchedBuffs[buffId] = true
-    end
+    -- See TogglePlayerBuffWatch: untracking keeps the entry listed
+    targetWatchedBuffs[buffId] = targetWatchedBuffs[buffId] ~= true
 end
 
 -- Check if a player buff is being watched
@@ -586,12 +1165,116 @@ function BuffSettingsWindow.IsTargetBuffWatched(buffId)
 end
 
 -- Toggle the buff selection window visibility
+
+-- ===================================================================
+-- One-time welcome card
+-- ===================================================================
+-- Shown on first load only. The flag lives on the settings ROOT rather than in
+-- the display settings, because it is a property of the install rather than of
+-- a character, and RESERVED_ROOT_KEYS keeps it through the schema migration.
+local infoCardWindow
+
+local function showInfoCard()
+    if infoCardWindow then
+        infoCardWindow:Show(true)
+        return
+    end
+
+    local w, h = 380, 168
+    infoCardWindow = api.Interface:CreateEmptyWindow("ttpInfoCard", "UIParent")
+    infoCardWindow:SetExtent(w, h)
+    infoCardWindow:AddAnchor("CENTER", "UIParent", "CENTER", 0, -60)
+
+    local outline = infoCardWindow:CreateColorDrawable(0, 0, 0, 0.96, "background")
+    outline:AddAnchor("TOPLEFT", infoCardWindow, 0, 0)
+    outline:AddAnchor("BOTTOMRIGHT", infoCardWindow, 0, 0)
+
+    local body = infoCardWindow:CreateColorDrawable(0.06, 0.06, 0.068, 0.96, "background")
+    body:AddAnchor("TOPLEFT", infoCardWindow, 1, 1)
+    body:AddAnchor("BOTTOMRIGHT", infoCardWindow, -1, -1)
+
+    local header = infoCardWindow:CreateColorDrawable(0.09, 0.09, 0.11, 0.98, "background")
+    header:SetExtent(w - 2, 30)
+    header:AddAnchor("TOPLEFT", infoCardWindow, 1, 1)
+
+    local accent = infoCardWindow:CreateColorDrawable(0, 0.75, 0.75, 0.85, "background")
+    accent:SetExtent(4, 30)
+    accent:AddAnchor("TOPLEFT", infoCardWindow, 1, 1)
+
+    local function label(id, text, x, y, width, size, r, g, b)
+        local l = infoCardWindow:CreateChildWidget("label", id, 0, true)
+        l:SetExtent(width, 16)
+        l:AddAnchor("TOPLEFT", infoCardWindow, x, y)
+        l:SetText(text)
+        l.style:SetAlign(ALIGN.LEFT)
+        l.style:SetFontSize(size)
+        l.style:SetColor(r, g, b, 1)
+        l:Clickable(false)
+        return l
+    end
+
+    label("ttpInfoTitle", "TrackThatPlease", 16, 7, 240, 15, 1, 0.84, 0)
+    label("ttpInfoL1", "This addon is completely free.", 20, 46, w - 40, 13, 1, 1, 1)
+    label("ttpInfoL2", "If you find it useful, in-game donations are appreciated",
+          20, 68, w - 40, 13, 0.5, 0.5, 0.5)
+    label("ttpInfoL3", "but never expected.", 20, 86, w - 40, 13, 0.5, 0.5, 0.5)
+    label("ttpInfoL4", "Character:  Dehling", 20, 110, w - 40, 14, 1, 0.84, 0)
+
+    -- Close button, built inline: createFlatButton is local to Initialize and
+    -- this runs before that.
+    local btn = infoCardWindow:CreateChildWidget("button", "ttpInfoClose", 0, true)
+    btn:SetExtent(96, 26)
+    btn:AddAnchor("TOPLEFT", infoCardWindow, w - 116, h - 40)
+    btn:SetText("")
+    local bBorder = btn:CreateColorDrawable(0, 0, 0, 0.92, "background")
+    bBorder:AddAnchor("TOPLEFT", btn, 0, 0)
+    bBorder:AddAnchor("BOTTOMRIGHT", btn, 0, 0)
+    local bFill = btn:CreateColorDrawable(0.16, 0.21, 0.30, 0.96, "background")
+    bFill:AddAnchor("TOPLEFT", btn, 1, 1)
+    bFill:AddAnchor("BOTTOMRIGHT", btn, -1, -1)
+    local bLabel = btn:CreateChildWidget("label", "ttpInfoCloseLbl", 0, true)
+    bLabel:SetExtent(92, 14)
+    bLabel:AddAnchor("CENTER", btn, 0, 0)
+    bLabel:SetText("Got it")
+    bLabel.style:SetAlign(ALIGN.CENTER)
+    bLabel.style:SetFontSize(13)
+    bLabel.style:SetColor(0.88, 0.90, 0.93, 1)
+    bLabel:Clickable(false)
+    btn:SetHandler("OnClick", function()
+        infoCardWindow:Show(false)
+        local root = ensureRoot()
+        if root then
+            root.infoCardSeen = true
+            pcall(function() api.SaveSettings() end)
+        end
+    end)
+
+    infoCardWindow:EnableDrag(true)
+    infoCardWindow:SetHandler("OnDragStart", function(self) self:StartMoving() end)
+    infoCardWindow:SetHandler("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    infoCardWindow:Show(true)
+end
+
+function BuffSettingsWindow.ShowInfoCard()
+    pcall(showInfoCard)
+end
+
+function BuffSettingsWindow.MaybeShowInfoCard()
+    local root = ensureRoot()
+    if root and root.infoCardSeen ~= true then
+        pcall(showInfoCard)
+    end
+end
+
 function BuffSettingsWindow.ToggleBuffSelectionWindow()
     if buffSelectionWindow then
         local isVisible = buffSelectionWindow:IsVisible()
         buffSelectionWindow:Show(not isVisible)
         if not isVisible then
             fillBuffData(buffScrollList, 1, searchEditBox:GetText())
+            -- First time the window is opened, not at load: the card lands when
+            -- the player is already looking at the addon.
+            BuffSettingsWindow.MaybeShowInfoCard()
         end
     else
         api.Log:Err("Buff selection window does not exist")
@@ -601,6 +1284,12 @@ end
 -- Check if the buff selection window is visible
 function BuffSettingsWindow.IsWindowVisible()
     return buffSelectionWindow and buffSelectionWindow:IsVisible() or false
+end
+
+-- Expose the window so main.lua can include it in reload-ghost cleanup
+-- (CreateEmptyWindow widgets are invisible to FindWidget)
+function BuffSettingsWindow.GetWindow()
+    return buffSelectionWindow
 end
 
 function BuffSettingsWindow.RefreshLoggedBuffs()
@@ -650,86 +1339,771 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     BuffList.InitializeAllBuffs(buffsLogger)
     ----------------------------------------
 
-    -- Create Settings UI elements-----------------
-    -- Layout variables
+   -- Create Settings UI elements-----------------
+   -- Layout variables
     local columnGap = 18
-    local columnWidth = 160
-    local sliderRowHeight = 60
-    local positionRowHeight = 60
-    local controlRowHeight = 60
-    local controlsTopGap = 4
-     local leftMargin = 28
-     local topMargin = 52
-     -- Column positions
-     local x1 = leftMargin
-     local x2 = leftMargin + columnWidth + columnGap
-     local x3 = leftMargin + (columnWidth + columnGap) * 2
-     -- Row positions
-     local y1 = topMargin
-     local y2 = y1 + sliderRowHeight
-     local y3 = y2 + sliderRowHeight
-     local y4 = y3 + sliderRowHeight
-    local y5 = y4 + positionRowHeight
-    local y6 = y5 + controlRowHeight + controlsTopGap
-    local y7 = y6 + controlRowHeight
-    local y8 = y7 + controlRowHeight
+    local columnWidth = 80
+    local rowHeight = 55
+    local leftMargin = 40
+    local topMargin = 50
+    -- Column positions
+    local x1 = leftMargin                                
+    local x2 = leftMargin + columnWidth + columnGap      
+    local x3 = leftMargin + (columnWidth + columnGap) * 2
+    local x4 = leftMargin + (columnWidth + columnGap) * 3
+    --local x5 = leftMargin + (columnWidth + columnGap) * 4
+    -- Row positions
+    local y1 = topMargin                                 
+    local y2 = y1 + rowHeight                     
+    local y3 = y2 + rowHeight             
+    local y4 = y3 + rowHeight        
+    local y5 = y4 + rowHeight          
     
     
     --================= Create the main window =================--
-    buffSelectionWindow = api.Interface:CreateWindow("buffSelectorWindow", "Track List")
-    buffSelectionWindow:SetWidth(600)
-    buffSelectionWindow:SetHeight(900)
+    -- BetterBars-style flat dark shell: CreateEmptyWindow + color drawables
+    -- (outline, body, header bar, accent stripe) instead of the default game
+    -- window chrome. Drag and close are wired manually below.
+    local wndWidth, wndHeight = 500, 892
+    buffSelectionWindow = api.Interface:CreateEmptyWindow("buffSelectorWindow", "UIParent")
+    buffSelectionWindow:SetExtent(wndWidth, wndHeight)
     buffSelectionWindow:AddAnchor("CENTER", "UIParent", "CENTER", 0, 0)
 
-    local function createAnchor(x, y)
+    local wndOutline = buffSelectionWindow:CreateColorDrawable(0, 0, 0, 0.96, "background")
+    wndOutline:AddAnchor("TOPLEFT", buffSelectionWindow, 0, 0)
+    wndOutline:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, 0, 0)
+
+    local wndBody = buffSelectionWindow:CreateColorDrawable(0.06, 0.06, 0.068, 0.96, "background")
+    wndBody:AddAnchor("TOPLEFT", buffSelectionWindow, 1, 1)
+    wndBody:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, -1, -1)
+
+    local wndHeader = buffSelectionWindow:CreateColorDrawable(0.09, 0.09, 0.11, 0.98, "background")
+    wndHeader:SetExtent(wndWidth - 2, 34)
+    wndHeader:AddAnchor("TOPLEFT", buffSelectionWindow, 1, 1)
+
+    local wndAccent = buffSelectionWindow:CreateColorDrawable(0, 0.75, 0.75, 0.85, "background")
+    wndAccent:SetExtent(4, 34)
+    wndAccent:AddAnchor("TOPLEFT", buffSelectionWindow, 1, 1)
+
+    local wndTitle = buffSelectionWindow:CreateChildWidget("label", "ttpWndTitle", 0, true)
+    wndTitle:SetExtent(220, 18)
+    wndTitle:AddAnchor("TOPLEFT", buffSelectionWindow, 16, 9)
+    wndTitle:SetText("TrackThatPlease")
+    wndTitle.style:SetFontSize(17)
+    wndTitle.style:SetAlign(ALIGN.LEFT)
+    wndTitle.style:SetColor(1, 0.84, 0, 1)
+
+    -- (the close button is created flat-style after the UI factories below)
+    -- Stay open when ESC is pressed, unlike BetterBars/CustomUI: ESC opens the
+    -- game menu, which is also where this window is launched from, so closing on
+    -- it fights the user. Close with the X, the ESC-menu entry, or "ttp" in chat.
+    pcall(function()
+        if buffSelectionWindow.SetCloseOnEscape then
+            buffSelectionWindow:SetCloseOnEscape(false)
+        end
+    end)
+
+    -- EnableDrag is required for CreateEmptyWindow-based shells
+    if buffSelectionWindow.EnableDrag then buffSelectionWindow:EnableDrag(true) end
+    buffSelectionWindow:SetHandler("OnDragStart", function(self)
+        self:StartMoving()
+        api.Cursor:ClearCursor()
+        api.Cursor:SetCursorImage(CURSOR_PATH.MOVE, 0, 0)
+    end)
+    buffSelectionWindow:SetHandler("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        api.Cursor:ClearCursor()
+    end)
+
+    local s = BuffSettingsWindow.settings
+
+    -- Tooltips are owned by the window rather than the hovered control, so that
+    -- Raise() can lift them above the dropdowns and the search box (siblings)
+    -- instead of being trapped inside a button's own subtree.
+    local function addTooltip(id, target, text)
+        return helpers.createTooltip(id, target, text, nil, nil, buffSelectionWindow)
+    end
+
+    --================= Flat-UI factories (BetterBars style) =================--
+    local function createAnchor(target, x, y)
         return {
             anchor = "TOPLEFT",
-            target = buffSelectionWindow,
+            target = target,
             relativeAnchor = "TOPLEFT",
             x = x,
             y = y
         }
     end
 
+    local function createSectionPanel(id, x, y, w, h, titleText)
+        local p = buffSelectionWindow:CreateChildWidget("emptywidget", id, 0, true)
+        p:SetExtent(w, h)
+        p:AddAnchor("TOPLEFT", buffSelectionWindow, x, y)
+        local bg = p:CreateColorDrawable(0.045, 0.045, 0.052, 0.84, "background")
+        bg:AddAnchor("TOPLEFT", p, 0, 0)
+        bg:AddAnchor("BOTTOMRIGHT", p, 0, 0)
+        local hdr = p:CreateColorDrawable(0.09, 0.09, 0.11, 0.95, "background")
+        hdr:SetExtent(w, 22)
+        hdr:AddAnchor("TOPLEFT", p, 0, 0)
+        local accent = p:CreateColorDrawable(0, 0.75, 0.75, 0.85, "background")
+        accent:SetExtent(4, 22)
+        accent:AddAnchor("TOPLEFT", p, 0, 0)
+        local t = p:CreateChildWidget("label", id .. "_title", 0, true)
+        t:SetExtent(w - 28, 16)
+        t:AddAnchor("TOPLEFT", p, 14, 3)
+        t:SetText(titleText)
+        t.style:SetFontSize(12)
+        t.style:SetAlign(ALIGN.LEFT)
+        t.style:SetColor(1, 0.84, 0, 1)
+        p:Show(true)
+        return p
+    end
+
+    local TONE_ACTIVE = {0.12, 0.28, 0.15, 0.95}
+    local TONE_IDLE = {0.14, 0.14, 0.16, 0.95}
+
+    local function createFlatButton(parent, id, text, x, y, w, h, onClick)
+        local btn = parent:CreateChildWidget("button", id, 0, true)
+        btn:SetExtent(w, h)
+        btn:AddAnchor("TOPLEFT", parent, x, y)
+        btn:SetText("")
+        local border = btn:CreateColorDrawable(0, 0, 0, 0.92, "background")
+        border:AddAnchor("TOPLEFT", btn, 0, 0)
+        border:AddAnchor("BOTTOMRIGHT", btn, 0, 0)
+        local fill = btn:CreateColorDrawable(TONE_IDLE[1], TONE_IDLE[2], TONE_IDLE[3], TONE_IDLE[4], "background")
+        fill:AddAnchor("TOPLEFT", btn, 1, 1)
+        fill:AddAnchor("BOTTOMRIGHT", btn, -1, -1)
+        local lbl = btn:CreateChildWidget("label", id .. "_txt", 0, true)
+        lbl:SetExtent(w - 4, 14)
+        lbl:AddAnchor("CENTER", btn, 0, 0)
+        lbl:SetText(text)
+        lbl.style:SetFontSize(12)
+        lbl.style:SetAlign(ALIGN.CENTER)
+        lbl.style:SetColor(1, 1, 1, 1)
+        lbl:Clickable(false)
+        btn._fill = fill
+        btn._label = lbl
+        function btn:SetFlatText(v) self._label:SetText(v or "") end
+        function btn:SetTone(c) self._fill:SetColor(c[1], c[2], c[3], c[4]) end
+        function btn:SetFlatTextColor(r, g, b, a) self._label.style:SetColor(r, g, b, a) end
+        if onClick then btn:SetHandler("OnClick", onClick) end
+        btn:Show(true)
+        return btn
+    end
+
+    -- Flat horizontal slider. The engine's W_CTRL scroll widget renders as a
+    -- VERTICAL scrollbar, so this one is drawn from drawables (track + fill)
+    -- and driven by -/+ step buttons and the mouse wheel over the track.
+    local sliderCount = 0
+    -- A check drawn like the watched-list rows: a flat 14px box whose fill
+    -- carries the state. Same geometry and the same two colours as
+    -- UpdateBuffSelectedAppearance uses, so the two read as one control.
+    local function createFlatCheck(panel, id, labelText, x, y, w, isOn, onToggle)
+        local btn = panel:CreateChildWidget("button", id, 0, true)
+        btn:SetExtent(w, 20)
+        btn:AddAnchor("TOPLEFT", panel, x, y)
+        btn:SetText("")
+
+        -- Box right, label left: the same reading order as the watched-list
+        -- rows, and it lands the box in the column the sliders put their values
+        -- in. Anchored to the right edge so it follows the width, not a constant.
+        local border = btn:CreateColorDrawable(0, 0, 0, 0.92, "overlay")
+        border:SetExtent(14, 14)
+        border:AddAnchor("RIGHT", btn, 0, 0)
+        local fill = btn:CreateColorDrawable(0.14, 0.14, 0.16, 1, "overlay")
+        fill:SetExtent(12, 12)
+        fill:AddAnchor("RIGHT", btn, -1, 0)
+
+        local lbl = btn:CreateChildWidget("label", id .. "_lbl", 0, true)
+        lbl:SetExtent(w - 22, 16)
+        lbl:AddAnchor("LEFT", btn, 0, 0)
+        lbl:SetText(labelText)
+        lbl.style:SetAlign(ALIGN.LEFT)
+        lbl.style:SetFontSize(13)
+        lbl.style:SetColor(1, 0.84, 0, 1)
+        lbl:Clickable(false)
+
+        local function refresh()
+            if isOn() then
+                fill:SetColor(0, 0.75, 0.75, 1)      -- cyan accent = on
+            else
+                fill:SetColor(0.14, 0.14, 0.16, 1)
+            end
+        end
+        function btn:OnClick()
+            onToggle()
+            refresh()
+        end
+        btn:SetHandler("OnClick", btn.OnClick)
+        refresh()
+        return btn, refresh
+    end
+
+    local function createSliderRow(panel, y, labelText, minV, maxV, value, onChanged, displayFn)
+        sliderCount = sliderCount + 1
+        local id = "ttpSlider" .. sliderCount
+        displayFn = displayFn or tostring
+
+        local trackW, trackH = 202, 16
+        local cur = math.max(minV, math.min(maxV, value))
+
+        local lbl = panel:CreateChildWidget("label", id .. "_lbl", 0, true)
+        lbl:SetExtent(102, 16)
+        lbl:AddAnchor("TOPLEFT", panel, 14, y + 2)
+        lbl:SetText(labelText)
+        lbl.style:SetAlign(ALIGN.LEFT)
+        lbl.style:SetFontSize(13)
+        lbl.style:SetColor(1, 0.84, 0, 1)
+
+        local valLbl = panel:CreateChildWidget("label", id .. "_val", 0, true)
+        valLbl:SetExtent(52, 16)
+        valLbl:AddAnchor("TOPLEFT", panel, 404, y + 2)
+        valLbl:SetText(displayFn(cur))
+        valLbl.style:SetAlign(ALIGN.CENTER)
+        valLbl.style:SetFontSize(13)
+        valLbl.style:SetColor(1, 1, 1, 1)
+
+        -- Track with proportional fill (button so it receives wheel input)
+        local track = panel:CreateChildWidget("button", id .. "_track", 0, true)
+        track:SetExtent(trackW, trackH)
+        track:AddAnchor("TOPLEFT", panel, 148, y)
+        track:SetText("")
+        local trackBorder = track:CreateColorDrawable(0, 0, 0, 0.92, "background")
+        trackBorder:AddAnchor("TOPLEFT", track, 0, 0)
+        trackBorder:AddAnchor("BOTTOMRIGHT", track, 0, 0)
+        local trackBg = track:CreateColorDrawable(0.10, 0.10, 0.12, 0.95, "background")
+        trackBg:AddAnchor("TOPLEFT", track, 1, 1)
+        trackBg:AddAnchor("BOTTOMRIGHT", track, -1, -1)
+        local fill = track:CreateColorDrawable(0, 0.55, 0.55, 0.9, "background")
+        fill:AddAnchor("TOPLEFT", track, 1, 1)
+
+        local function refreshFill()
+            local frac = (cur - minV) / (maxV - minV)
+            local w = math.floor(frac * (trackW - 2) + 0.5)
+            if w < 1 then
+                fill:SetVisible(false)
+            else
+                fill:SetVisible(true)
+                fill:SetExtent(w, trackH - 2)
+            end
+        end
+        refreshFill()
+
+        local function apply(nv)
+            if nv < minV then nv = minV end
+            if nv > maxV then nv = maxV end
+            if nv == cur then return end
+            cur = nv
+            valLbl:SetText(displayFn(cur))
+            refreshFill()
+            onChanged(cur)
+        end
+
+        -- Mouse wheel over the track adjusts the value quickly
+        track:SetHandler("OnWheelUp", function() apply(cur + 1) end)
+        track:SetHandler("OnWheelDown", function() apply(cur - 1) end)
+
+        local function makeStepBtn(suffix, text, x, delta)
+            local b = panel:CreateChildWidget("button", id .. suffix, 0, true)
+            b:SetExtent(18, trackH)
+            b:AddAnchor("TOPLEFT", panel, x, y)
+            b:SetText("")
+            local bb = b:CreateColorDrawable(0, 0, 0, 0.92, "background")
+            bb:AddAnchor("TOPLEFT", b, 0, 0)
+            bb:AddAnchor("BOTTOMRIGHT", b, 0, 0)
+            local bf = b:CreateColorDrawable(0.16, 0.16, 0.18, 0.95, "background")
+            bf:AddAnchor("TOPLEFT", b, 1, 1)
+            bf:AddAnchor("BOTTOMRIGHT", b, -1, -1)
+            local bl = b:CreateChildWidget("label", id .. suffix .. "_t", 0, true)
+            bl:SetExtent(16, 14)
+            bl:AddAnchor("CENTER", b, 0, 0)
+            bl:SetText(text)
+            bl.style:SetFontSize(13)
+            bl.style:SetAlign(ALIGN.CENTER)
+            bl.style:SetColor(1, 1, 1, 1)
+            bl:Clickable(false)
+            b:SetHandler("OnClick", function() apply(cur + delta) end)
+            b:Show(true)
+            return b
+        end
+        makeStepBtn("_dec", "-", 124, -1)
+        makeStepBtn("_inc", "+", 354, 1)
+        track:Show(true)
+    end
+
+    -- Header close button (flat style)
+    createFlatButton(buffSelectionWindow, "ttpWndHelpBtn", "?", wndWidth - 60, 6, 24, 22, function()
+        BuffSettingsWindow.ShowInfoCard()
+    end)
+
+    createFlatButton(buffSelectionWindow, "ttpWndCloseBtn", "X", wndWidth - 32, 6, 24, 22, function()
+        buffSelectionWindow:Show(false)
+    end)
+
+    -- Sits below the Select All row, which is anchored to the same bottom edge
+    -- but stays on the right, so the two do not meet.
+    local credit = buffSelectionWindow:CreateChildWidget("label", "ttpCredit", 0, true)
+    credit:SetExtent(260, 11)
+    credit:AddAnchor("BOTTOMLEFT", buffSelectionWindow, 6, -4)
+    credit:SetText("TrackThatPlease - " .. BuffSettingsWindow.ADDON_VERSION .. " - By Dehling")
+    credit.style:SetAlign(ALIGN.LEFT)
+    credit.style:SetFontSize(10)
+    credit.style:SetColor(0.30, 0.31, 0.35, 1)
+    credit:Clickable(false)
+
+    --================= DISPLAY section =================--
+    local displayPanel = createSectionPanel("ttpDisplayPanel", 16, 42, 468, 172, "DISPLAY")
+    createSliderRow(displayPanel, 32, "Icon size", 25, 58, s.iconSize, function(v)
+        BuffSettingsWindow.settings.iconSize = v
+        queueSave()
+    end)
+    createSliderRow(displayPanel, 58, "Icon spacing", 1, 10, s.iconSpacing, function(v)
+        BuffSettingsWindow.settings.iconSpacing = v
+        queueSave()
+    end)
+    createSliderRow(displayPanel, 84, "Text size", 10, 36, s.fontSize, function(v)
+        BuffSettingsWindow.settings.fontSize = v
+        queueSave()
+    end)
+    createSliderRow(displayPanel, 110, "Max buffs", 3, BuffSettingsWindow.MAX_BUFFS_COUNT, s.maxBuffsShown, function(v)
+        BuffSettingsWindow.settings.maxBuffsShown = v
+        queueSave()
+    end)
+
+    -- Label starts on the sliders' left edge; the box is right-anchored, so the
+    -- width lands it under their "-" step button (that sits at 124 and is 18
+    -- wide, so its centre is 133; a 14px box ending at 140 centres on the same).
+    createFlatCheck(displayPanel, "ttpStacksCheck", "Show stacks", 14, 138, 126,
+        function() return BuffSettingsWindow.settings.shouldShowStacks == true end,
+        function()
+            BuffSettingsWindow.settings.shouldShowStacks =
+                not (BuffSettingsWindow.settings.shouldShowStacks == true)
+            BuffSettingsWindow.SaveSettings()
+        end)
+
+    --================= TIMERS & POSITION section =================--
+    local timersPanel = createSectionPanel("ttpTimersPanel", 16, 220, 468, 142, "TIMERS & POSITION")
+    createSliderRow(timersPanel, 32, "Buff warn", 0, 10, math.floor(s.buffWarnTime / 1000), function(v)
+        BuffSettingsWindow.settings.buffWarnTime = v * 1000
+        queueSave()
+    end, function(v) return v .. "s" end)
+    createSliderRow(timersPanel, 58, "Debuff warn", 0, 10, math.floor(s.debuffWarnTime / 1000), function(v)
+        BuffSettingsWindow.settings.debuffWarnTime = v * 1000
+        queueSave()
+    end, function(v) return v .. "s" end)
+    -- Offsets are stored as -60..-20; the slider works in 0..40 and maps
+    createSliderRow(timersPanel, 84, "Player offset", 0, 40, s.playerBuffVerticalOffset + 60, function(v)
+        BuffSettingsWindow.settings.playerBuffVerticalOffset = v - 60
+        queueSave()
+    end, function(v) return tostring(v - 60) end)
+    createSliderRow(timersPanel, 110, "Target offset", 0, 40, s.targetBuffVerticalOffset + 60, function(v)
+        BuffSettingsWindow.settings.targetBuffVerticalOffset = v - 60
+        queueSave()
+    end, function(v) return tostring(v - 60) end)
+
+    --================= PLAYER BAR section =================--
+    local playerBarPanel = createSectionPanel("ttpPlayerBarPanel", 16, 368, 468, 62, "PLAYER BAR")
+
+    -- Two modes. Nameplate compensation used to be a third one; it is the
+    -- Nametag toggle beside this now, because it is orthogonal to where the bar
+    -- sits - it corrects how the game reports the position, not where you want it.
+    local MODE_LABELS = {
+        head = "Position: Above head",
+        fixed = "Position: Fixed screen",
+    }
+    local MODE_NEXT = { head = "fixed", fixed = "head" }
+
+    local modeBtn, moveBtn, nametagBtn
+    local moveActive = false
+    local modeBtnRefresh, nametagBtnRefresh, slotRefresh
+
+    -- One slot holds both of the next two. "Move bar" only means anything in
+    -- Fixed screen mode, and nameplate compensation only runs in Above head, so
+    -- whichever applies to the current mode is the one on screen.
+    slotRefresh = function()
+        local fixed = BuffSettingsWindow.settings.playerBarMode == "fixed"
+        moveBtn:Show(fixed)
+        nametagBtn:Show(not fixed)
+    end
+
+    modeBtnRefresh = function()
+        local mode = BuffSettingsWindow.settings.playerBarMode
+        modeBtn:SetFlatText(MODE_LABELS[mode] or MODE_LABELS.head)
+        modeBtn:SetTone(mode ~= "head" and TONE_ACTIVE or TONE_IDLE)
+    end
+    modeBtn = createFlatButton(playerBarPanel, "ttpModeBtn", "", 14, 32, 170, 22, function()
+        local mode = BuffSettingsWindow.settings.playerBarMode
+        local nextMode = MODE_NEXT[mode] or "head"
+        -- Leaving Fixed mid-drag would hide the button still holding the drag
+        -- open, stranding the bar unlocked with no way to lock it. End it first.
+        if moveActive and nextMode ~= "fixed" then
+            moveActive = false
+            moveBtn:SetFlatText("Move bar")
+            moveBtn:SetTone(TONE_IDLE)
+            api:Emit("TTP_PLAYERBAR_UNLOCK")
+        end
+        BuffSettingsWindow.settings.playerBarMode = nextMode
+        modeBtnRefresh()
+        slotRefresh()
+        -- the compensation calibrates its resting height on entry, so clear the
+        -- old calibration whenever the mode changes
+        api:Emit("TTP_BARMODE_CHANGED")
+        BuffSettingsWindow.SaveSettings()
+    end)
+    modeBtnRefresh()
+    addTooltip("ttpModeBtnTip", modeBtn,
+        "'Above head' follows the character in the world. \n" ..
+        "'Fixed screen' pins the bar to a screen position instead, so nothing \n" ..
+        "in the world can move it. \n" ..
+        "The button beside this one follows the mode: Nametag in 'Above head', \n" ..
+        "'Move bar' in 'Fixed screen'.")
+
+    moveBtn = createFlatButton(playerBarPanel, "ttpMoveBtn", "Move bar", 196, 32, 130, 22, function()
+        moveActive = not moveActive
+        moveBtn:SetFlatText(moveActive and "Done moving" or "Move bar")
+        moveBtn:SetTone(moveActive and TONE_ACTIVE or TONE_IDLE)
+        api:Emit("TTP_PLAYERBAR_UNLOCK")
+        modeBtnRefresh() -- unlocking forces fixed mode
+    end)
+    moveBtn:Show(false) -- slotRefresh decides, once both buttons exist
+    addTooltip("ttpMoveBtnTip", moveBtn,
+        "Shows the player bar as a colored box you can drag anywhere. \n" ..
+        "Click again to lock the position (uses Fixed screen mode).")
+
+    -- Shares the slot above with "Move bar": shown in Above head mode only
+    nametagBtnRefresh = function()
+        local on = BuffSettingsWindow.settings.nametagEnabled == true
+        nametagBtn:SetFlatText(on and "Nametag: ON" or "Nametag: OFF")
+        nametagBtn:SetTone(on and TONE_ACTIVE or TONE_IDLE)
+    end
+    nametagBtn = createFlatButton(playerBarPanel, "ttpNametagBtn", "", 196, 32, 130, 22, function()
+        BuffSettingsWindow.settings.nametagEnabled =
+            not (BuffSettingsWindow.settings.nametagEnabled == true)
+        nametagBtnRefresh()
+        -- the compensation calibrates its resting height on entry
+        api:Emit("TTP_BARMODE_CHANGED")
+        BuffSettingsWindow.SaveSettings()
+    end)
+    nametagBtnRefresh()
+    addTooltip("ttpNametagBtnTip", nametagBtn,
+        "Turn this ON if your own character's nameplate is showing. \n" ..
+        "The game anchors overhead UI to the nameplate, so with it on the \n" ..
+        "reported position wanders and the bar jitters. This cancels that \n" ..
+        "wander and holds the bar steady through jumps and abrupt skills. \n" ..
+        "Leave it OFF with no nameplate - plain 'Above head' is already \n" ..
+        "correct then.")
+    slotRefresh()
+
+    --================= TRACKING section =================--
+    local trackingPanel = createSectionPanel("ttpTrackingPanel", 16, 436, 468, 140, "TRACKING")
+
+    -- The two dropdowns build their own label and anchor themselves; only the
+    -- search box and the scroll list still come from the shared helpers.
     local anchors = {
-        -- Row 1
-        maxBuffsDropdown = createAnchor(x1, y1),
-        fontSizeDropdown = createAnchor(x2, y1),
-        iconSizeDropdown = createAnchor(x3, y1),
-        -- Row 2
-        iconSpacingDropdown = createAnchor(x1, y2),
-        debuffWarnTimeDropdown = createAnchor(x2, y2),
-        buffWarnTimeDropdown = createAnchor(x3, y2),
-        -- Row 3
-        smoothingSpeedDropdown = createAnchor(x1, y3),
-        blinkSpeedDropdown = createAnchor(x2, y3),
-        playerHorizontalOffsetDropdown = createAnchor(x1, y4),
-        playerVerticalOffsetDropdown = createAnchor(x2, y4),
-        targetHorizontalOffsetDropdown = createAnchor(x1, y5),
-        targetVerticalOffsetDropdown = createAnchor(x2, y5),
-        -- Row 4
-        playerAboveUnitFrameCheckbox = createAnchor(x3, y4 + 18),
-        targetAboveUnitFrameCheckbox = createAnchor(x3, y5 + 18),
-        -- Row 5
-        trackTypeDropdown = createAnchor(x1, y6),
-        categoryDropdown = createAnchor(x2, y6),
-        shouldShowStacksCheckbox = createAnchor(x3, y6),
-        -- Row 6
-        searchEditBox = createAnchor(x1, y7),
-        selectAllButton = createAnchor(x3 + 16, y7 + 16),
-        -- Row 7
-        buffScrollList = createAnchor(leftMargin, y8),
+        searchEditBox = createAnchor(trackingPanel, 310, 32),
+        buffScrollList = createAnchor(buffSelectionWindow, 40, 586),
     }
 
+    --================= Watched-list scope / sharing row =================--
+    -- Display settings are always shared; only the watched lists can be per-character.
+    local TONE_WARN = {0.38, 0.12, 0.12, 0.95}
+    local buffScopeBtn, promoteBtn
+
+    -- The copy button always pushes the list currently in use into the other
+    -- scope, so its direction follows the toggle: Character -> Global while this
+    -- character has its own list, Global -> Character otherwise. Either way it
+    -- overwrites a list that may hold hundreds of buffs, so it arms on the first
+    -- click and only acts on a second one.
+    local promoteArmed = false
+    local promoteArmToken = 0
+    local function promoteIdleText()
+        return BuffSettingsWindow.IsUsingCharacterBuffs() and "To global" or "To character"
+    end
+    local function disarmPromote()
+        promoteArmed = false
+        if promoteBtn then
+            promoteBtn:SetFlatText(promoteIdleText())
+            promoteBtn:SetTone(TONE_IDLE)
+        end
+    end
+
+    refreshBuffScopeButton = function()
+        local perCharacter = BuffSettingsWindow.IsUsingCharacterBuffs()
+        if buffScopeBtn then
+            buffScopeBtn:SetFlatText(perCharacter and "List: Character" or "List: Global")
+            buffScopeBtn:SetTone(perCharacter and TONE_ACTIVE or TONE_IDLE)
+        end
+        if promoteBtn then
+            disarmPromote() -- also relabels for the new direction
+        end
+    end
+
+    buffScopeBtn = createFlatButton(trackingPanel, "ttpBuffScopeBtn", "", 14, 108, 150, 22, function()
+        if not BuffSettingsWindow.SetUseCharacterBuffs(not BuffSettingsWindow.IsUsingCharacterBuffs()) then
+            api.Log:Err("TrackThatPlease: character not loaded yet, try again in a moment.")
+            return
+        end
+        refreshBuffScopeButton()
+        refreshWatchedUI()
+    end)
+    addTooltip("ttpBuffScopeBtnTip", buffScopeBtn,
+        "'Global' shares one watched-buff list across all your characters. \n" ..
+        "'Character' gives this character its own list, seeded from the global \n" ..
+        "one. Switching back keeps both lists, so nothing is lost. \n" ..
+        "All other settings are always shared.")
+
+    promoteBtn = createFlatButton(trackingPanel, "ttpPromoteBtn", "To global", 170, 108, 98, 22, function()
+        if not promoteArmed then
+            promoteArmed = true
+            promoteArmToken = promoteArmToken + 1
+            local token = promoteArmToken
+            promoteBtn:SetFlatText("Overwrite?")
+            promoteBtn:SetTone(TONE_WARN)
+            api:DoIn(4000, function()
+                if promoteArmed and promoteArmToken == token then disarmPromote() end
+            end)
+            return
+        end
+
+        local toGlobal = BuffSettingsWindow.IsUsingCharacterBuffs()
+        disarmPromote()
+
+        local ok
+        if toGlobal then
+            ok = BuffSettingsWindow.PromoteCharacterBuffsToGlobal()
+        else
+            ok = BuffSettingsWindow.CopyGlobalBuffsToCharacter()
+        end
+
+        if not ok then
+            api.Log:Err("TrackThatPlease: character not loaded yet, try again in a moment.")
+            return
+        end
+        if toGlobal then
+            api.Log:Info("TrackThatPlease: global list replaced with this character's list.")
+        else
+            api.Log:Info("TrackThatPlease: this character's stored list replaced with the global one. "
+                .. "Switch 'List' to Character to use it.")
+        end
+        refreshBuffScopeButton()
+        refreshWatchedUI()
+    end)
+    addTooltip("ttpPromoteBtnTip", promoteBtn,
+        "Copies the list you are using into the other scope, overwriting it - \n" ..
+        "click twice to confirm. \n" ..
+        "On 'Character' it reads 'To global': your list becomes the shared one \n" ..
+        "that every character on 'Global' inherits. \n" ..
+        "On 'Global' it reads 'To character': the shared list overwrites this \n" ..
+        "character's own stored list.")
+
+    local exportBtn = createFlatButton(trackingPanel, "ttpExportBtn", "Export", 274, 108, 88, 22, function()
+        local playerCount, targetCount, backedUp = BuffSettingsWindow.ExportWatchedBuffs()
+        if not playerCount then
+            api.Log:Err("TrackThatPlease: could not write " .. BuffSettingsWindow.SHARE_PATH)
+            return
+        end
+        api.Log:Info(string.format("TrackThatPlease: exported %d player / %d target buffs to %s",
+            playerCount, targetCount, BuffSettingsWindow.SHARE_PATH))
+        if backedUp then
+            api.Log:Info("TrackThatPlease: the previous file was kept as "
+                .. BuffSettingsWindow.SHARE_BACKUP_PATH)
+        end
+    end)
+    addTooltip("ttpExportBtnTip", exportBtn,
+        "Writes the list you are using to \n" ..
+        BuffSettingsWindow.SHARE_PATH .. " \n" ..
+        "Send that file to a friend as-is - they can import it without renaming. \n" ..
+        "If the file already held someone else's list it is kept as \n" ..
+        BuffSettingsWindow.SHARE_BACKUP_PATH)
+
+    local importBtn = createFlatButton(trackingPanel, "ttpImportBtn", "Import", 366, 108, 88, 22, function()
+        local addedPlayer, addedTarget = BuffSettingsWindow.ImportWatchedBuffs()
+        if not addedPlayer then
+            api.Log:Err("TrackThatPlease: could not read " .. BuffSettingsWindow.SHARE_PATH)
+            return
+        end
+        api.Log:Info(string.format("TrackThatPlease: imported %d new player / %d new target buffs",
+            addedPlayer, addedTarget))
+        refreshWatchedUI()
+    end)
+    addTooltip("ttpImportBtnTip", importBtn,
+        "Reads a shared list from \n" ..
+        BuffSettingsWindow.SHARE_PATH .. " \n" ..
+        "and adds it to the list you are using. Only adds - it never removes \n" ..
+        "buffs you already watch.")
+
+    refreshBuffScopeButton()
+
+    --================= Flat styling for the shared field widgets =================--
+    -- The dropdowns and the search box come from util/helpers with the game's
+    -- default chrome and 14/15px gold text, which is left over from the old look
+    -- and clashes with the flat panels. Restyle them here rather than in helpers,
+    -- so the shared module keeps its current behaviour for any other caller.
+    local FIELD_LABEL_COLOR = {0.62, 0.66, 0.72, 1}
+    local FIELD_TEXT_COLOR = {0.88, 0.90, 0.93, 1}
+    -- Selection tints, brightened for legibility on the dark shell
+    local TINT_PLAYER = {0.45, 0.85, 0.50, 1}
+    local TINT_TARGET = {0.95, 0.45, 0.45, 1}
+    local TINT_BOTH = {0.95, 0.80, 0.45, 1}
+    local TINT_ALL = {0.62, 0.66, 0.72, 1}
+    local TINT_LOGGED = {0.95, 0.70, 0.35, 1}
+    local TINT_WATCHED = {0.35, 0.80, 0.80, 1} -- matches the cyan panel accent
+
+    local function styleFieldLabel(label)
+        if not label then return end
+        pcall(function()
+            -- Same extent for every field label: the shared helper leaves its own
+            -- label at the default height, so its text sits higher in the row than
+            -- the ones built here unless the box matches.
+            label:SetExtent(140, 16)
+            label.style:SetFontSize(12)
+            label.style:SetAlign(ALIGN.LEFT)
+            label.style:SetColor(FIELD_LABEL_COLOR[1], FIELD_LABEL_COLOR[2],
+                                 FIELD_LABEL_COLOR[3], FIELD_LABEL_COLOR[4])
+        end)
+    end
+
+    --================= Flat dropdown (replaces the engine combo box) =================--
+    -- The engine combo box draws its frame, its arrow and its expanded list from
+    -- whichever in-game UI skin the player has selected, and the popup is built
+    -- internally where it cannot be restyled. This builds the whole control out of
+    -- our own widgets instead, so it looks identical on every UI skin.
+    local FIELD_ROW_Y = 58
+    local openDropdown -- at most one popup is visible at a time
+
+    local function createFieldLabel(id, text, x)
+        local lbl = trackingPanel:CreateChildWidget("label", id, 0, true)
+        lbl:AddAnchor("TOPLEFT", trackingPanel, x, 32)
+        lbl:SetText(text)
+        lbl:Clickable(false)
+        styleFieldLabel(lbl)
+        return lbl
+    end
+
+    -- Down-pointing triangle drawn from stacked 1px rows: no font glyph involved,
+    -- so it renders the same everywhere.
+    local function drawArrow(parent, rightInset)
+        local rows = {}
+        local widths = { 9, 7, 5, 3, 1 }
+        for i, w in ipairs(widths) do
+            local row = parent:CreateColorDrawable(0.62, 0.66, 0.72, 1, "overlay")
+            row:SetExtent(w, 1)
+            row:AddAnchor("RIGHT", parent, -rightInset - (9 - w) / 2, -2 + i)
+            table.insert(rows, row)
+        end
+        return rows
+    end
+
+    local function createFlatDropdown(id, x, w, options, defaultIndex, onSelect)
+        local dd = trackingPanel:CreateChildWidget("button", id, 0, true)
+        dd:SetExtent(w, 28)
+        dd:AddAnchor("TOPLEFT", trackingPanel, x, FIELD_ROW_Y)
+        dd:SetText("")
+
+        local border = dd:CreateColorDrawable(0, 0, 0, 0.92, "background")
+        border:AddAnchor("TOPLEFT", dd, 0, 0)
+        border:AddAnchor("BOTTOMRIGHT", dd, 0, 0)
+        local fill = dd:CreateColorDrawable(0.10, 0.10, 0.12, 1, "background")
+        fill:AddAnchor("TOPLEFT", dd, 1, 1)
+        fill:AddAnchor("BOTTOMRIGHT", dd, -1, -1)
+
+        local text = dd:CreateChildWidget("label", id .. "_txt", 0, true)
+        text:SetExtent(w - 28, 14)
+        text:AddAnchor("LEFT", dd, 8, 0)
+        text.style:SetFontSize(13)
+        text.style:SetAlign(ALIGN.LEFT)
+        text:Clickable(false)
+
+        local arrowRows = drawArrow(dd, 8)
+
+        -- The popup hangs off the window, not the panel, so it can overlap the
+        -- rows beneath it instead of being clipped by the TRACKING panel.
+        local rowHeight = 22
+        local popup = buffSelectionWindow:CreateChildWidget("emptywidget", id .. "_pop", 0, true)
+        popup:SetExtent(w, #options * rowHeight + 2)
+        popup:AddAnchor("TOPLEFT", dd, "BOTTOMLEFT", 0, 2)
+        local popBorder = popup:CreateColorDrawable(0, 0, 0, 0.96, "background")
+        popBorder:AddAnchor("TOPLEFT", popup, 0, 0)
+        popBorder:AddAnchor("BOTTOMRIGHT", popup, 0, 0)
+        local popFill = popup:CreateColorDrawable(0.08, 0.08, 0.095, 1, "background")
+        popFill:AddAnchor("TOPLEFT", popup, 1, 1)
+        popFill:AddAnchor("BOTTOMRIGHT", popup, -1, -1)
+        popup:Show(false)
+
+        dd.dropdownItem = options
+        dd._index = defaultIndex or 1
+
+        function dd:HidePopup()
+            popup:Show(false)
+            if openDropdown == self then openDropdown = nil end
+        end
+
+        function dd:GetSelectedIndex()
+            return self._index
+        end
+
+        function dd:Select(index)
+            index = tonumber(index) or 1
+            if index < 1 or index > #options then index = 1 end
+            self._index = index
+            text:SetText(options[index] or "")
+        end
+
+        function dd:SetAllTextColor(color)
+            color = color or { 1, 1, 1, 1 }
+            text.style:SetColor(color[1], color[2], color[3], color[4] or 1)
+            for _, row in ipairs(arrowRows) do
+                row:SetColor(color[1], color[2], color[3], color[4] or 1)
+            end
+        end
+
+        for i, option in ipairs(options) do
+            local row = popup:CreateChildWidget("button", id .. "_o" .. i, 0, true)
+            row:SetExtent(w - 2, rowHeight)
+            row:AddAnchor("TOPLEFT", popup, 1, 1 + (i - 1) * rowHeight)
+            row:SetText("")
+            local rowFill = row:CreateColorDrawable(0.08, 0.08, 0.095, 1, "background")
+            rowFill:AddAnchor("TOPLEFT", row, 0, 0)
+            rowFill:AddAnchor("BOTTOMRIGHT", row, 0, 0)
+            local rowLabel = row:CreateChildWidget("label", id .. "_ol" .. i, 0, true)
+            rowLabel:SetExtent(w - 14, 14)
+            rowLabel:AddAnchor("LEFT", row, 7, 0)
+            rowLabel:SetText(option)
+            rowLabel.style:SetFontSize(13)
+            rowLabel.style:SetAlign(ALIGN.LEFT)
+            rowLabel.style:SetColor(0.88, 0.90, 0.93, 1)
+            rowLabel:Clickable(false)
+            row:SetHandler("OnEnter", function() rowFill:SetColor(0.17, 0.17, 0.20, 1) end)
+            row:SetHandler("OnLeave", function() rowFill:SetColor(0.08, 0.08, 0.095, 1) end)
+            row:SetHandler("OnClick", function()
+                dd:Select(i)
+                dd:HidePopup()
+                if onSelect then onSelect(i, options[i]) end
+            end)
+            row:Show(true)
+        end
+
+        dd:SetHandler("OnClick", function()
+            if popup:IsVisible() then
+                dd:HidePopup()
+                return
+            end
+            if openDropdown and openDropdown ~= dd then
+                openDropdown:HidePopup()
+            end
+            openDropdown = dd
+            popup:Show(true)
+            pcall(function() popup:Raise() end)
+        end)
+
+        dd:Select(defaultIndex or 1)
+        dd:Show(true)
+        return dd
+    end
+
     --================= Create trackTypeDropdown =================--
-    local trackTypeLabel
-    trackTypeDropdown, trackTypeLabel = helpers.CreateDropdownWithLabel(
-        buffSelectionWindow,
-        anchors.trackTypeDropdown,
-        "Track type:",
-        0, -- Width will be set automatically
-        trackTypes,
-        currentTrackType, -- "Player" as default
+    local trackTypeLabel = createFieldLabel("ttpTrackTypeLbl", "Track type:", 14)
+    trackTypeDropdown = createFlatDropdown("ttpTrackTypeDd", 14, 120, trackTypes, currentTrackType,
         function(selectedIndex, selectedValue)
             local newTrackType = selectedIndex
             if newTrackType ~= currentTrackType then
@@ -738,277 +2112,48 @@ function BuffSettingsWindow.Initialize(buffsLogger)
                 fillBuffData(buffScrollList, 1, searchEditBox:GetText())
             end
             if selectedIndex == TRACK_TYPE_PLAYER then -- Player
-                trackTypeDropdown:SetAllTextColor({0.0, 0.4, 0.0, 0.9})
+                trackTypeDropdown:SetAllTextColor(TINT_PLAYER)
             elseif selectedIndex == TRACK_TYPE_TARGET then -- Target
-                trackTypeDropdown:SetAllTextColor({0.5, 0.0, 0.0, 0.9})
+                trackTypeDropdown:SetAllTextColor(TINT_TARGET)
+            else -- Both
+                trackTypeDropdown:SetAllTextColor(TINT_BOTH)
             end
         end
     )
-    trackTypeDropdown:SetAllTextColor({0.0, 0.4, 0.0, 0.9})
+    trackTypeDropdown:SetAllTextColor(TINT_PLAYER)
+    addTooltip("ttpTrackTypeTip", trackTypeDropdown,
+        "Which list the checkmarks below apply to. \n" ..
+        "'Both' keeps the Player and Target lists separate but applies every \n" ..
+        "click to each of them, and only shows a checkmark when a buff is on \n" ..
+        "both. Clicking a buff watched on just one adds it to the other.")
 
-    --================= Create shouldShowStacks checkbox =================--
-    local shouldShowStacksCheckbox, shouldShowStacksLabel = helpers.CreateCheckboxWithLabel(
-        buffSelectionWindow,
-        anchors.shouldShowStacksCheckbox,
-        "Show stacks:",
-        "Yes",
-        BuffSettingsWindow.settings.shouldShowStacks,
-        function(isChecked)
-            BuffSettingsWindow.settings.shouldShowStacks = isChecked
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
+    -- (show-stacks toggle now lives in the PLAYER BAR panel above)
     
 
-    --================= Create numeric sliders =================--
-    local maxBuffsMin, maxBuffsMax = GetOptionBounds(maxBuffsOptions)
-    local _, maxBuffsLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.maxBuffsDropdown,
-        "Max buffs to display:",
-        columnWidth,
-        BuffSettingsWindow.settings.maxBuffsShown,
-        maxBuffsMin,
-        maxBuffsMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.maxBuffsShown = value
-            BuffSettingsWindow.SaveSettings()
-        end,
-        "Maximum number of tracked buffs to display"
-    )
+    -- (max buffs is now a slider in the DISPLAY panel)
 
-    local iconSizeMin, iconSizeMax = GetOptionBounds(iconSizeOptions)
-    local _, iconSizeLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.iconSizeDropdown,
-        "Icon size:",
-        columnWidth,
-        BuffSettingsWindow.settings.iconSize,
-        iconSizeMin,
-        iconSizeMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.iconSize = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
+    -- (icon size is now a slider in the DISPLAY panel)
 
-    local iconSpacingMin, iconSpacingMax = GetOptionBounds(iconSpacingOptions)
-    local _, iconSpacingLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.iconSpacingDropdown,
-        "Icon spacing:",
-        columnWidth,
-        BuffSettingsWindow.settings.iconSpacing,
-        iconSpacingMin,
-        iconSpacingMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.iconSpacing = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
+    -- (icon spacing is now a slider in the DISPLAY panel)
 
-    local fontSizeMin, fontSizeMax = GetOptionBounds(fontSizeOptions)
-    local _, fontSizeLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.fontSizeDropdown,
-        "Text size:",
-        columnWidth,
-        BuffSettingsWindow.settings.fontSize,
-        fontSizeMin,
-        fontSizeMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.fontSize = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
+    -- (text size is now a slider in the DISPLAY panel)
 
-    local warnTimeMin, warnTimeMax = GetOptionBounds(warnTimeOptions)
-    local _, debuffWarnTimeLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.debuffWarnTimeDropdown,
-        "Debuff expiry warn(s):",
-        columnWidth,
-        BuffSettingsWindow.settings.debuffWarnTime / 1000,
-        warnTimeMin,
-        warnTimeMax,
-        0.5,
-        function(value)
-            BuffSettingsWindow.settings.debuffWarnTime = value * 1000
-            BuffSettingsWindow.SaveSettings()
-        end,
-        nil,
-        2
-    )
+    -- (debuff warn time is now a slider in the TIMERS & POSITION panel)
 
-    local _, buffWarnTimeLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.buffWarnTimeDropdown,
-        "Buff expiry warn(s):",
-        columnWidth,
-        BuffSettingsWindow.settings.buffWarnTime / 1000,
-        warnTimeMin,
-        warnTimeMax,
-        0.5,
-        function(value)
-            BuffSettingsWindow.settings.buffWarnTime = value * 1000
-            BuffSettingsWindow.SaveSettings()
-        end,
-        nil,
-        2
-    )
+    -- (buff warn time is now a slider in the TIMERS & POSITION panel)
 
-    local smoothingMin, smoothingMax = GetOptionBounds(smoothingSpeedOptions)
-    local _, smoothingSpeedLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.smoothingSpeedDropdown,
-        "Smoothing speed:",
-        columnWidth,
-        BuffSettingsWindow.settings.smoothingSpeed,
-        smoothingMin,
-        smoothingMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.smoothingSpeed = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
 
-    local smoothingTooltipButton = buffSelectionWindow:CreateChildWidget("button", "smoothingTooltipButton", 0, true)
-    smoothingTooltipButton:AddAnchor("LEFT", smoothingSpeedLabel, "RIGHT", 6, 0)
-    smoothingTooltipButton:SetExtent(18, 18)
-    smoothingTooltipButton:SetText("?")
-    smoothingTooltipButton.style:SetFontSize(13)
-    smoothingTooltipButton:SetTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
-    smoothingTooltipButton:SetHighlightTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
-    smoothingTooltipButton:SetPushedTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
-    smoothingTooltipButton:SetDisabledTextColor(FONT_COLOR.BLUE[1], FONT_COLOR.BLUE[2], FONT_COLOR.BLUE[3], 1)
-    helpers.createTooltip(
-        "smoothingTooltip",
-        smoothingTooltipButton,
-        "Reduces jitter when buffs follow the player above the character instead of the unit frame.",
-        0,
-        -6
-    )
+    -- (player vertical offset is now a slider in the TIMERS & POSITION panel)
 
-    local blinkSpeedMin, blinkSpeedMax = GetOptionBounds(blinkSpeedOptions)
-    local _, blinkSpeedLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.blinkSpeedDropdown,
-        "Warning blink speed:",
-        columnWidth,
-        BuffSettingsWindow.settings.buffBlinkSpeed,
-        blinkSpeedMin,
-        blinkSpeedMax,
-        0.5,
-        function(value)
-            BuffSettingsWindow.settings.buffBlinkSpeed = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-
-    local offsetXMin, offsetXMax = GetOptionBounds(buffsXOffsetOptions)
-    local _, playerHorizontalOffsetLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.playerHorizontalOffsetDropdown,
-        "Player X offset:",
-        columnWidth,
-        BuffSettingsWindow.settings.playerBuffHorizontalOffset,
-        offsetXMin,
-        offsetXMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.playerBuffHorizontalOffset = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-
-    local offsetYMin, offsetYMax = GetOptionBounds(buffsYOffsetOptions)
-    local _, playerVerticalOffsetLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.playerVerticalOffsetDropdown,
-        "Player Y offset:",
-        columnWidth,
-        BuffSettingsWindow.settings.playerBuffVerticalOffset,
-        offsetYMin,
-        offsetYMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.playerBuffVerticalOffset = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-
-    local _, targetHorizontalOffsetLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.targetHorizontalOffsetDropdown,
-        "Target X offset:",
-        columnWidth,
-        BuffSettingsWindow.settings.targetBuffHorizontalOffset,
-        offsetXMin,
-        offsetXMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.targetBuffHorizontalOffset = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-
-    local _, targetVerticalOffsetLabel = helpers.CreateSliderWithLabel(
-        buffSelectionWindow,
-        anchors.targetVerticalOffsetDropdown,
-        "Target Y offset:",
-        columnWidth,
-        BuffSettingsWindow.settings.targetBuffVerticalOffset,
-        offsetYMin,
-        offsetYMax,
-        1,
-        function(value)
-            BuffSettingsWindow.settings.targetBuffVerticalOffset = value
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-
-    local playerAboveUnitFrameCheckbox, playerAboveUnitFrameLabel = helpers.CreateInlineCheckboxWithLabel(
-        buffSelectionWindow,
-        anchors.playerAboveUnitFrameCheckbox,
-        "Show above player frame:",
-        "Yes",
-        BuffSettingsWindow.settings.showAbovePlayerUnitFrame,
-        function(isChecked)
-            BuffSettingsWindow.settings.showAbovePlayerUnitFrame = isChecked
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-    playerAboveUnitFrameCheckbox:RemoveAllAnchors()
-    playerAboveUnitFrameCheckbox:AddAnchor("TOP", playerAboveUnitFrameLabel, "BOTTOM", 0, 8)
-
-    local targetAboveUnitFrameCheckbox, targetAboveUnitFrameLabel = helpers.CreateInlineCheckboxWithLabel(
-        buffSelectionWindow,
-        anchors.targetAboveUnitFrameCheckbox,
-        "Show above target frame:",
-        "Yes",
-        BuffSettingsWindow.settings.showAboveTargetUnitFrame,
-        function(isChecked)
-            BuffSettingsWindow.settings.showAboveTargetUnitFrame = isChecked
-            BuffSettingsWindow.SaveSettings()
-        end
-    )
-    targetAboveUnitFrameCheckbox:RemoveAllAnchors()
-    targetAboveUnitFrameCheckbox:AddAnchor("TOP", targetAboveUnitFrameLabel, "BOTTOM", 0, 8)
+    -- (target vertical offset is now a slider in the TIMERS & POSITION panel)
 
        --================= Create category dropdownn =================--
-    local categoryLabel
-    categoryDropdown, categoryLabel = helpers.CreateDropdownWithLabel(
-        buffSelectionWindow,
-        anchors.categoryDropdown,
-        "Buff category:",
-        160,
-        categories,
-        currentCategory, -- "Watched Buffs" as default
+    local categoryDropdownTooltip = "'All static buffs' - all buffs in the game (many are outdated) \n" ..
+        "'All logged buffs' - buffs collected by logged \n" ..
+        "'Watched buffs' - buffs that are watched on (Player/Target)"
+
+    local categoryLabel = createFieldLabel("ttpCategoryLbl", "Buff category:", 150)
+    categoryDropdown = createFlatDropdown("ttpCategoryDd", 150, 140, categories, currentCategory,
         function(selectedIndex, selectedValue)
             local newCategory = selectedIndex
             if newCategory ~= currentCategory then
@@ -1019,13 +2164,14 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             categoryDropdown:UpdateTextColor(selectedIndex)
         end
     )
+    addTooltip("ttpCategoryDdTip", categoryDropdown, categoryDropdownTooltip)
     function categoryDropdown:UpdateTextColor(selectedIndex)
         if selectedIndex == CATEGORY_TYPE_ALL then
-            self:SetAllTextColor({0.3, 0.3, 0.3, 1.0})
+            self:SetAllTextColor(TINT_ALL)
         elseif selectedIndex == CATEGORY_TYPE_WATCHED then
-            self:SetAllTextColor({0.2, 0.4, 0.7, 1.0})
+            self:SetAllTextColor(TINT_WATCHED)
         elseif selectedIndex == CATEGORY_TYPE_LOGGED then
-            self:SetAllTextColor({0.6, 0.3, 0.1, 1.0})
+            self:SetAllTextColor(TINT_LOGGED)
         end
     end
     categoryDropdown:UpdateTextColor(currentCategory)
@@ -1037,7 +2183,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         buffSelectionWindow,
         anchors.searchEditBox,
         "Search:",
-        340,        -- width
+        140,        -- width
         28,         -- height
         "",         -- defaultText
         false,      -- isDigitOnly
@@ -1047,37 +2193,52 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             fillBuffData(buffScrollList, 1, text)
         end
     )
+    styleFieldLabel(searchLabel)
+    -- Drop the gold LARGE text the helper applies, matching the flat button labels
+    pcall(function()
+        searchEditBox.style:SetFontSize(13)
+        searchEditBox.style:SetColor(FIELD_TEXT_COLOR[1], FIELD_TEXT_COLOR[2],
+                                     FIELD_TEXT_COLOR[3], FIELD_TEXT_COLOR[4])
+    end)
 
-    --================= Create select all button =================--
-    selectAllButton = buffSelectionWindow:CreateChildWidget("button", "selectAllButton", 0, true)
-    selectAllButton:SetText("Select All")
-    local saAnchor = anchors.selectAllButton
-    selectAllButton:AddAnchor(saAnchor.anchor, saAnchor.target, saAnchor.relativeAnchor, saAnchor.x, saAnchor.y)
-    ApplyButtonSkin(selectAllButton, BUTTON_BASIC.DEFAULT)
-    selectAllButton:SetExtent(90, 30)
-    selectAllButton.style:SetFontSize(12)
-    selectAllButton:SetTextColor(unpack(FONT_COLOR.DEFAULT))
-    selectAllButton:SetHighlightTextColor(unpack(FONT_COLOR.DEFAULT))
-    selectAllButton:SetPushedTextColor(unpack(FONT_COLOR.DEFAULT))
-    selectAllButton:SetDisabledTextColor(unpack(FONT_COLOR.DEFAULT))
+    -- The dropdowns are ours and already sit on FIELD_ROW_Y; the search box still
+    -- comes from the shared helper, which anchors it below its own label. Pin it to
+    -- the same row so all three line up.
+    pcall(function()
+        searchEditBox:RemoveAllAnchors()
+        searchEditBox:AddAnchor("TOPLEFT", trackingPanel, 310, FIELD_ROW_Y)
+    end)
+
+    -- The search box is an engine widget, so its chrome is drawn from whichever
+    -- in-game UI skin the player has selected. Paint a flat backdrop over it on the
+    -- background layer (after the widget's own skin, beneath its text) so it
+    -- matches the dropdowns on every skin.
+    pcall(function()
+        local border = searchEditBox:CreateColorDrawable(0, 0, 0, 0.92, "background")
+        border:AddAnchor("TOPLEFT", searchEditBox, 0, 0)
+        border:AddAnchor("BOTTOMRIGHT", searchEditBox, 0, 0)
+        local fill = searchEditBox:CreateColorDrawable(0.10, 0.10, 0.12, 1, "background")
+        fill:AddAnchor("TOPLEFT", searchEditBox, 1, 1)
+        fill:AddAnchor("BOTTOMRIGHT", searchEditBox, -1, -1)
+    end)
+
+    --================= Create select all button (flat) =================--
+    selectAllButton = createFlatButton(buffSelectionWindow, "selectAllButton", "Select All", 0, 0, 104, 24, nil)
+    selectAllButton:RemoveAllAnchors()
+    -- Bottom bar, right side (next to the page control / count label)
+    selectAllButton:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, "BOTTOMRIGHT", -16, -14)
 
     function selectAllButton:OnClick()
-        local watchedBuffs = currentTrackType == TRACK_TYPE_PLAYER and playerWatchedBuffs or targetWatchedBuffs
-
         local allSelected = #filteredBuffs > 0
         for _, buff in ipairs(filteredBuffs) do
-            if not watchedBuffs[buff.id] then
+            if not isWatchedForCurrentType(buff.id) then
                 allSelected = false
                 break
             end
         end
 
         for _, buff in ipairs(filteredBuffs) do
-            if allSelected then
-                watchedBuffs[buff.id] = nil  -- Unselect all
-            else
-                watchedBuffs[buff.id] = true  -- Select all
-            end
+            setWatchedForCurrentType(buff.id, not allSelected)
         end
 
 --[[         --  "Watched Buffs" switch to  "All Buffs"
@@ -1095,68 +2256,274 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     
 
     --================= Create the buff scroll lis =================--
-    buffScrollListWidth = 564
+    buffScrollListWidth = 470
     buffScrollList = W_CTRL.CreatePageScrollListCtrl("buffScrollList", buffSelectionWindow)
     buffScrollList:SetWidth(buffScrollListWidth)
     local scrlAnchor = anchors.buffScrollList
     buffScrollList:AddAnchor(scrlAnchor.anchor, buffSelectionWindow, scrlAnchor.relativeAnchor, scrlAnchor.x, scrlAnchor.y)
-    buffScrollList:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, -4, -70)
+    -- Right edge at -16 lines the scrollbar up with the section panels and the
+    -- Select All button, which all end 16px in from the window edge
+    buffScrollList:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, -16, -56)
     buffScrollList:InsertColumn("", buffScrollListWidth -5, 0, DataSetFunc, nil, nil, LayoutSetFunc)
-    buffScrollList:InsertRows(10, false)
+    -- Row count sets the slot height (list height / rows). 8 rows left ~31px per
+    -- slot against a 30px icon, so the icons ran into each other; 7 gives ~35px.
+    buffScrollList:InsertRows(7, false)
     buffScrollList:SetColumnHeight(1)
+
+    -- The list's scrollbar is drawn from the player's UI skin, like the page
+    -- control and the combo boxes were. Its widget is not exposed by name in the
+    -- api stub, so probe the likely fields and paint a flat track onto whichever
+    -- one answers. The paint goes on the background layer, so the thumb - which
+    -- draws above it - stays visible.
+    local function findChild(owner, names)
+        if not owner then return nil end
+        for _, name in ipairs(names) do
+            local candidate = owner[name]
+            if candidate and candidate.CreateColorDrawable then
+                return candidate, name
+            end
+        end
+        return nil
+    end
+
+    -- Flat fill painted over a widget. "background" sits under whatever the widget
+    -- draws itself (use where a glyph or thumb must stay visible); "overlay" covers
+    -- it outright (use where the widget's own art should be replaced).
+    local function paintFlat(widget, layer, r, g, b, a)
+        if not widget then return end
+        pcall(function()
+            local border = widget:CreateColorDrawable(0, 0, 0, 0.92, layer)
+            border:AddAnchor("TOPLEFT", widget, 0, 0)
+            border:AddAnchor("BOTTOMRIGHT", widget, 0, 0)
+            local fill = widget:CreateColorDrawable(r, g, b, a, layer)
+            fill:AddAnchor("TOPLEFT", widget, 1, 1)
+            fill:AddAnchor("BOTTOMRIGHT", widget, -1, -1)
+        end)
+    end
+
+    local scrollWidget = findChild(buffScrollList, {
+        "scroll", "scrollBar", "scrollbar", "vscroll",
+        "verticalScroll", "scrollCtrl", "listScroll" })
+
+    -- Small triangle built from stacked 1px rows, centred on its parent. Same
+    -- approach as the dropdown arrow: no font glyph, so it renders identically
+    -- whatever UI skin is active. dir is "up" or "down".
+    local function drawTriangle(parent, dir, r, g, b)
+        -- Kept narrow enough to still fit once the scrollbar is slimmed down
+        local widths = { 7, 5, 3, 1 }
+        for i, width in ipairs(widths) do
+            local step = (dir == "up") and (#widths - i + 1) or i
+            local row = parent:CreateColorDrawable(r, g, b, 1, "overlay")
+            row:SetExtent(width, 1)
+            row:AddAnchor("CENTER", parent, 0, -3 + step)
+        end
+    end
+
+    if scrollWidget then
+        -- Names confirmed against the live widget tree: the slider lives at
+        -- scrollWidget.vs and its handle at scrollWidget.vs.thumb, with the bottom
+        -- arrow at scrollWidget.downButton.
+        local slider = findChild(scrollWidget, { "vs", "slider", "scrollBar" })
+        local thumb = findChild(slider or scrollWidget, { "thumb", "handle", "grip", "bar" })
+        local arrows = {}
+        for dir, names in pairs({
+            up = { "upButton", "up", "btnUp", "decBtn", "prevBtn", "topButton" },
+            down = { "downButton", "down", "btnDown", "incBtn", "nextBtn", "bottomButton" },
+        }) do
+            arrows[dir] = findChild(scrollWidget, names) or findChild(slider, names)
+        end
+
+        -- Slim the bar down to 70% of the skin's default width. Each part is
+        -- resized individually: narrowing the container does not cascade to the
+        -- slider, thumb or end buttons.
+        local SCROLLBAR_SCALE = 0.7
+        local function narrow(widget)
+            if not widget then return end
+            pcall(function()
+                local width = widget:GetWidth()
+                if width and width > 0 then
+                    widget:SetWidth(math.floor(width * SCROLLBAR_SCALE + 0.5))
+                end
+            end)
+        end
+        narrow(scrollWidget)
+        narrow(slider)
+        narrow(thumb)
+        narrow(arrows.up)
+        narrow(arrows.down)
+
+        -- Painted after resizing. Track goes behind so the thumb still draws over
+        -- it; the thumb and buttons go on overlay because the engine skin has to be
+        -- covered rather than sat behind.
+        --
+        -- The track is painted 1px wider than its widget on the right: the engine
+        -- sizes the thumb itself (it re-computes thumb geometry from the page
+        -- count, so SetWidth on it does not stick), and its rounding leaves the
+        -- thumb 1px wider than the track. Since the thumb cannot be narrowed,
+        -- the track's paint is widened to meet it - anchor offsets may extend
+        -- past the widget's own bounds, so this only touches our drawables.
+        local TRACK_RIGHT_EXTEND = 1
+        pcall(function()
+            local border = scrollWidget:CreateColorDrawable(0, 0, 0, 0.92, "background")
+            border:AddAnchor("TOPLEFT", scrollWidget, 0, 0)
+            border:AddAnchor("BOTTOMRIGHT", scrollWidget, TRACK_RIGHT_EXTEND, 0)
+            local fill = scrollWidget:CreateColorDrawable(0.10, 0.10, 0.12, 1, "background")
+            fill:AddAnchor("TOPLEFT", scrollWidget, 1, 1)
+            fill:AddAnchor("BOTTOMRIGHT", scrollWidget, TRACK_RIGHT_EXTEND - 1, -1)
+        end)
+        if thumb then
+            -- Edge to edge rather than paintFlat's border+inset fill: the 1px inset
+            -- left a dark sliver down the thumb's left side against the track.
+            pcall(function()
+                local fill = thumb:CreateColorDrawable(0, 0.55, 0.55, 1, "overlay")
+                fill:AddAnchor("TOPLEFT", thumb, 0, 0)
+                fill:AddAnchor("BOTTOMRIGHT", thumb, 0, 0)
+            end)
+        end
+        for dir, arrow in pairs(arrows) do
+            -- Same right-extension as the track: the arrow buttons are engine-sized
+            -- like the thumb, so their paint is stretched to the shared right edge
+            -- rather than resizing the widget.
+            pcall(function()
+                local border = arrow:CreateColorDrawable(0, 0, 0, 0.92, "overlay")
+                border:AddAnchor("TOPLEFT", arrow, 0, 0)
+                border:AddAnchor("BOTTOMRIGHT", arrow, TRACK_RIGHT_EXTEND, 0)
+                local fill = arrow:CreateColorDrawable(0.14, 0.14, 0.16, 1, "overlay")
+                fill:AddAnchor("TOPLEFT", arrow, 1, 1)
+                fill:AddAnchor("BOTTOMRIGHT", arrow, TRACK_RIGHT_EXTEND - 1, -1)
+            end)
+            pcall(function() drawTriangle(arrow, dir, 0.62, 0.66, 0.72) end)
+        end
+    else
+        api.Log:Err("TrackThatPlease: scrollbar widget not found, left unstyled.")
+    end
 
     -- Filter count label
     filteredCountLabel = buffSelectionWindow:CreateChildWidget("label", "filteredCountLabel", 0, true)
     filteredCountLabel:SetText("Displayed: 0")
-    ApplyTextColor(filteredCountLabel, FONT_COLOR.BLACK)
+    -- Same treatment as the credit line at the window's foot: it is there when
+    -- wanted but should not compete with the controls beside it.
     filteredCountLabel.style:SetAlign(ALIGN.LEFT)
-    filteredCountLabel.style:SetFontSize(13)
-    filteredCountLabel:AddAnchor("TOPLEFT", buffScrollList, "BOTTOMLEFT", 0, 15) 
+    filteredCountLabel.style:SetFontSize(10)
+    filteredCountLabel.style:SetColor(0.30, 0.31, 0.35, 1)
+    filteredCountLabel:AddAnchor("TOPLEFT", buffScrollList, "BOTTOMLEFT", 0, 8)
     
     function buffScrollList:OnPageChangedProc(curPageIdx)
+        buffScrollList.curPageIdx = curPageIdx
         fillBuffData(buffScrollList, curPageIdx, searchEditBox:GetText())
     end
-    
+
+    --================= Custom pager =================--
+    -- The engine page control is drawn from the player's UI skin like the combo
+    -- boxes were, so it is hidden and replaced with flat buttons driving the same
+    -- list. Its paging logic is still used - only its widgets are hidden.
+    pcall(function() buffScrollList.pageControl:Show(false) end)
+
+    local pageLabel
+    local pagePrevBtn, pageNextBtn
+
+    local function gotoPage(index)
+        if index < 1 then index = 1 end
+        if index > currentTotalPages then index = currentTotalPages end
+        pcall(function() buffScrollList:SetCurrentPage(index) end)
+        buffScrollList.curPageIdx = index
+        fillBuffData(buffScrollList, index, searchEditBox:GetText())
+    end
+
+    pagePrevBtn = createFlatButton(buffSelectionWindow, "ttpPagePrev", "<", 0, 0, 26, 22, function()
+        gotoPage((buffScrollList.curPageIdx or 1) - 1)
+    end)
+
+    pageNextBtn = createFlatButton(buffSelectionWindow, "ttpPageNext", ">", 0, 0, 26, 22, function()
+        gotoPage((buffScrollList.curPageIdx or 1) + 1)
+    end)
+
+    pageLabel = buffSelectionWindow:CreateChildWidget("label", "ttpPageLabel", 0, true)
+    pageLabel:SetExtent(58, 16)
+    pageLabel:SetText("1 / 1")
+    pageLabel.style:SetFontSize(13)
+    pageLabel.style:SetAlign(ALIGN.CENTER)
+    pageLabel.style:SetColor(1, 0.84, 0, 1)
+    pageLabel:Clickable(false)
+
+    -- Chained right to left off the Select All button rather than pinned to the
+    -- window centre: the "Displayed: 151-200 / 11867" label on the left grows with
+    -- the counts and used to run into a centred pager.
+    -- Centred on the window rather than hung off Select All. Select All is
+    -- anchored BOTTOMRIGHT at -16 and is 24 tall, so its centre line sits 26
+    -- above the bottom edge; matching that keeps the whole row level while the
+    -- pager itself is free to centre.
+    pageLabel:RemoveAllAnchors()
+    pageLabel:AddAnchor("CENTER", buffSelectionWindow, "BOTTOMLEFT", wndWidth / 2, -26)
+    pagePrevBtn:RemoveAllAnchors()
+    pagePrevBtn:AddAnchor("RIGHT", pageLabel, "LEFT", -6, 0)
+    pageNextBtn:RemoveAllAnchors()
+    pageNextBtn:AddAnchor("LEFT", pageLabel, "RIGHT", 6, 0)
+
+    refreshPager = function()
+        if not pageLabel then return end
+        local page = buffScrollList.curPageIdx or 1
+        if page > currentTotalPages then page = currentTotalPages end
+        pageLabel:SetText(page .. " / " .. currentTotalPages)
+        -- Grey the ends out rather than hiding them, so the row never reflows
+        local atStart, atEnd = page <= 1, page >= currentTotalPages
+        pagePrevBtn:SetFlatTextColor(atStart and 0.35 or 1, atStart and 0.35 or 1, atStart and 0.35 or 1, 1)
+        pageNextBtn:SetFlatTextColor(atEnd and 0.35 or 1, atEnd and 0.35 or 1, atEnd and 0.35 or 1, 1)
+    end
+    refreshPager()
+
+    -- Lets the settings layer redraw the list after the watched buffs are swapped
+    -- (scope toggle, or the character name resolving after load)
+    refreshWatchedUI = function()
+        if buffScrollList and searchEditBox then
+            fillBuffData(buffScrollList, 1, searchEditBox:GetText())
+        end
+    end
+
     fillBuffData(buffScrollList, 1, "")
     buffSelectionWindow:Show(false)
 
-    --================= Create record all buffs button =================--
-    recordAllButton = buffSelectionWindow:CreateChildWidget("button", "recordAllButton", 0, true)
-    recordAllButton:SetText("Start logging")
-    recordAllButton:AddAnchor("TOPLEFT", buffSelectionWindow, "TOPLEFT", 35, 10)
-    ApplyButtonSkin(recordAllButton, BUTTON_BASIC.DEFAULT)
-    recordAllButton:SetAutoResize(false)
-    recordAllButton:SetExtent(90, 28)
-    recordAllButton.style:SetFontSize(14)
-
-    function recordAllButton:UpdateTextColor(color)
-        local color = color or FONT_COLOR.DEFAULT
-        
-        self:SetTextColor(unpack(color))
-        self:SetHighlightTextColor(unpack(color))
-        self:SetPushedTextColor(unpack(color))
-        self:SetDisabledTextColor(unpack(color))
-    end
-    function recordAllButton:OnClick()
-        if BuffsLogger then
-          if BuffsLogger.isActive then
+    --================= Create record all buffs button (flat, header bar) =================--
+    recordAllButton = createFlatButton(buffSelectionWindow, "recordAllButton", "Start logging", wndWidth - 174, 6, 110, 22, function()
+        if not BuffsLogger then return end
+        if BuffsLogger.isActive then
             BuffsLogger.StopTracking()
-            recordAllButton:SetText("Start logging")
-            self:UpdateTextColor(FONT_COLOR.DEFAULT)
-          else
+            recordAllButton:SetFlatText("Start logging")
+            recordAllButton:SetTone(TONE_IDLE)
+        else
             BuffsLogger.StartTracking()
-            recordAllButton:SetText("Stop logging")
-            self:UpdateTextColor(FONT_COLOR.RED)
-          end
+            recordAllButton:SetFlatText("Stop logging")
+            recordAllButton:SetTone({0.38, 0.12, 0.12, 0.95}) -- red while recording
         end
-    end
-    recordAllButton:SetHandler("OnClick", recordAllButton.OnClick)
+    end)
+
+    -- Recording indicator, immediately left of the logging button. It used to sit
+    -- on the old floating HUD button, which no longer exists; main.lua pulses its
+    -- alpha through GetRecordingIcon while logging is active.
+    local recordingIcon = recordAllButton:CreateImageDrawable("Textures/Defaults/White.dds", "overlay")
+    recordingIcon:SetExtent(16, 16)
+    recordingIcon:AddAnchor("RIGHT", recordAllButton, "LEFT", -6, 0)
+    recordingIcon:SetSRGB(false)
+    recordingIcon:SetTgaTexture(RECORDING_ICON_PATH)
+    recordingIcon:SetVisible(false)
+    recordAllButton.recordingIndicationIcon = recordingIcon
+
+    addTooltip(
+        "recordAllButtonTooltip",
+        recordAllButton,
+        "This will start logging all buffs/debufs that are active on the player or target(s) during reccording time. \n" ..
+        "So later on you can use them to add to your 'Watched buffs', \n" ..
+        "You could find them under the 'All logged buffs' section of 'Buff category'"
+    )
 
     -- OnHide handler --------------------------------
     function buffSelectionWindow:OnHide()
+        -- A dropdown popup is parented to the window but shown independently, so
+        -- close it explicitly rather than leaving it floating
+        if openDropdown then openDropdown:HidePopup() end
         buffScrollList:DeleteAllDatas()
         BuffSettingsWindow.SaveSettings()
-    end 
+    end
     buffSelectionWindow:SetHandler("OnHide", buffSelectionWindow.OnHide)
 end
 --============================ ### End ### ==============================--
@@ -1172,10 +2539,10 @@ function BuffSettingsWindow.Cleanup()
         if buffSelectionWindow:IsVisible() then
             buffSelectionWindow:Show(false)
         end
+        pcall(function() api.Interface:Free(buffSelectionWindow) end)
         buffSelectionWindow = nil
     end
 
-    api.Log:Info("BuffWatchWindow: Cleanup completed successfully")
 end
 --============================ ### End ### ==============================--
 

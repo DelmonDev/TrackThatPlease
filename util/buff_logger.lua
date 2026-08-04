@@ -1,5 +1,5 @@
 local api = require("api")
-local logsPath = "TrackThatPlease/buffsLogs.txt"
+local logsPath = "TrackThatPlease/buff_logs/buffsLogs.txt"
 local BuffsLogger = {}
 BuffsLogger.isActive = false
 
@@ -10,14 +10,16 @@ local currentPlayerId = nil
 
 local function escapeString(str)
     if not str then return "" end
-    
-    -- Escape special characters
-    str = str:gsub("\"", "\\\"")  --  escape quotes
+
+    -- Backslashes must go first, or they destroy the escapes added below.
+    -- The loadFromFile pattern ([^"]*) cannot handle any quote inside a value,
+    -- so quotes are replaced with apostrophes instead of escaped.
     str = str:gsub("\\", "/")     -- replace to forwardslash
+    str = str:gsub("\"", "'")     -- quotes would break the parse format
     str = str:gsub("\n", "\\n")   -- Escape newlines
     str = str:gsub("\r", "\\r")   -- Escape carriage returns
     str = str:gsub("\t", "\\t")   -- Escape tabs
-    
+
     return str
 end
 
@@ -70,7 +72,7 @@ local function appendNewBuff(buff, unitName, buffTooltip)
         buffsSet[buff.buff_id] = entry
 
         -- log new buffs
-        -- api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%d]|r = |cFFDDA0DD%s|r", tostring(entry.id), tostring(entry.name)))
+        api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%s]|r = |cFFDDA0DD%s|r", tostring(entry.id), tostring(entry.name)))
 
         saveToFile()
         api:Emit("TTP_NEW_BUFF_LOGGED")
