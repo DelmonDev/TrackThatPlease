@@ -7,7 +7,7 @@ expiring-soon blink.
 Pick what matters to you out of the full game index, and stop squinting at the
 default frames to find out whether your buff is still up.
 
-![The TrackThatPlease settings window, showing the Display, Timers and Position, Player Bar and Tracking panels above the buff list](https://github.com/user-attachments/assets/5e4f9aeb-7530-49f5-a555-da2c18509776)
+![The TrackThatPlease settings window, showing the Display, Timers and Position, Player Bar and Tracking panels above the buff list](https://github.com/user-attachments/assets/0c02eae3-9c16-486b-8ec1-bef2c5f38343)
 
 ---
 
