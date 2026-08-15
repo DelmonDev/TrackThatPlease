@@ -1,6 +1,7 @@
 local api = require("api")
 local BuffList = require("TrackThatPlease/buff_helper")
 local helpers = require("TrackThatPlease/util/helpers")
+local Store = require("TrackThatPlease/util/settings_store")
 local BuffsLogger
 
 local BuffSettingsWindow = {}
@@ -9,7 +10,7 @@ BuffSettingsWindow.settings = {}
 BuffSettingsWindow.MAX_BUFFS_COUNT = 13
 -- Single source for the version: main.lua's addon table and the settings-window
 -- footer both read this, so they cannot disagree.
-BuffSettingsWindow.ADDON_VERSION = "3.0"
+BuffSettingsWindow.ADDON_VERSION = "3.1"
 -- Blinking "recording" indicator shown left of the logging button
 local RECORDING_ICON_PATH = "../Addon/TrackThatPlease/icons/rec-button.png"
 
@@ -31,9 +32,6 @@ local settingsRoot = {}
 local globalSettings = {}
 local characterSettings = {}
 local currentCharacterKey = "unknown"
--- True while we hold a table that api.GetSettings did not give us, so writes
--- would not persist. ensureRoot folds it into the real table once one appears.
-local rootIsDetached = false
 -- Attempts made to resolve the character name after load (see retryCharacterKeyLoad)
 local characterKeyRetries = 0
 
@@ -69,7 +67,6 @@ local SETTING_CLAMPS = {
     debuffWarnTime = { 0, 10000 },
     playerBuffVerticalOffset = { -60, -20 },
     targetBuffVerticalOffset = { -60, -20 },
-    UIScale = { 0.5, 3 },
 }
 
 local function clampNumber(value, minValue, maxValue)
@@ -78,12 +75,25 @@ local function clampNumber(value, minValue, maxValue)
     return value
 end
 
+-- The live UI scale, defensively: not readable while addons load (falls back
+-- to 1, the old behaviour), and never trusted as a divisor without a check.
+local function uiScaleOrOne()
+    local uiScale = api.Interface:GetUIScale()
+    if type(uiScale) ~= "number" or uiScale <= 0 then return 1 end
+    return uiScale
+end
+
 -- Keeps a saved widget position reachable. Old files store floats and can pin a
 -- widget to the very screen edge (btnSettingsPos = {1676.29, -0.0101827}), which
 -- leaves the settings button unclickable.
+--
+-- Positions are anchor offsets (UI units) but GetScreenWidth/Height return
+-- DEVICE pixels, so the bounds are divided by the live UI scale - see the
+-- space helpers in main.lua. Best effort at load time; main.lua re-clamps
+-- fixed-bar positions at apply time with the real scale.
 local function clampPosition(pos, widgetWidth, widgetHeight)
-    local screenWidth = api.Interface:GetScreenWidth()
-    local screenHeight = api.Interface:GetScreenHeight()
+    local screenWidth = api.Interface:GetScreenWidth() / uiScaleOrOne()
+    local screenHeight = api.Interface:GetScreenHeight() / uiScaleOrOne()
     local x = tonumber(pos and pos[1]) or 0
     local y = tonumber(pos and pos[2]) or 0
     x = clampNumber(x, 0, math.max(0, screenWidth - widgetWidth))
@@ -205,23 +215,13 @@ local function migrateSettings(root)
     api.Log:Info("TrackThatPlease: settings migrated to schema v" .. SCHEMA_VERSION)
 end
 
--- api.GetSettings hands back a live reference that api.SaveSettings serialises.
--- On a first run it can be nil, in which case we work on a detached table and
--- fold it into the real one as soon as the API produces it.
+-- The root now comes from the private settings store (util/settings_store),
+-- not api.GetSettings - see the header there for why. Store.Root() always
+-- returns the same session-lifetime table and folds early writes into the
+-- persisted content itself, which is what the old detached-root dance here
+-- used to do by hand.
 local function ensureRoot()
-    local fetched = api.GetSettings("TrackThatPlease")
-    if type(fetched) == "table" then
-        if rootIsDetached and type(settingsRoot) == "table" and settingsRoot ~= fetched then
-            for key, value in pairs(settingsRoot) do
-                if fetched[key] == nil then fetched[key] = value end
-            end
-        end
-        settingsRoot = fetched
-        rootIsDetached = false
-    elseif type(settingsRoot) ~= "table" or not rootIsDetached then
-        settingsRoot = {}
-        rootIsDetached = true
-    end
+    settingsRoot = Store.Root()
     return settingsRoot
 end
 
@@ -241,6 +241,12 @@ local function ensureBuckets()
         globalSettings.nametagEnabled = true
     end
     globalSettings.smoothingEnabled = nil -- smoothing was removed
+    -- UIScale was a load-time snapshot of api.Interface:GetUIScale() persisted
+    -- as a setting - but the scale is not even readable while addons load, and
+    -- its only consumer was a hand-tuned per-scale nudge table that correct
+    -- anchor-space math (see main.lua's screen helpers) made obsolete. Scrub
+    -- the stale key so old saves come out clean.
+    globalSettings.UIScale = nil
 
     if type(root.characters) ~= "table" then root.characters = {} end
     currentCharacterKey = getCurrentCharacterKey()
@@ -351,10 +357,9 @@ function BuffSettingsWindow.SaveSettings()
     end
 
 
-    -- Safely Save settings to file
-    pcall(function()
-        api.SaveSettings()
-    end)
+    -- Persist through the private store (never api.SaveSettings - see
+    -- util/settings_store.lua). Save() cannot throw; no pcall needed.
+    Store.Save()
 end
 
 -- Slider drags fire a change per tick; debounce the full settings flush
@@ -383,7 +388,6 @@ local function buildDefaultSettings()
     -- favour of the ESC menu entry. Any stale value left in a settings file is
     -- simply ignored.
     return {
-        UIScale = api.Interface:GetUIScale(),
         fontSize = 16,
         targetBuffVerticalOffset = -46,
         playerBuffVerticalOffset = -46,
@@ -402,8 +406,12 @@ local function buildDefaultSettings()
         -- not there for them, and leaving it on is a small regression.
         nametagEnabled = true,
         playerBarMode = "head", -- "head" follows the character; "fixed" pins to screen
-        playerBarPos = { math.floor(api.Interface:GetScreenWidth() / 2 - 80),
-                         math.floor(api.Interface:GetScreenHeight() * 0.6) },
+        -- Anchor space, so the device dimensions are divided by the UI scale.
+        -- Best effort: the scale is not readable at load time (falls back to
+        -- 1); the apply-time clamp in main.lua pulls a default that landed
+        -- off screen back into view once the real scale is known.
+        playerBarPos = { math.floor((api.Interface:GetScreenWidth() / 2) / uiScaleOrOne() - 80),
+                         math.floor((api.Interface:GetScreenHeight() * 0.6) / uiScaleOrOne()) },
     }
 end
 
@@ -519,7 +527,7 @@ function BuffSettingsWindow.SetUseCharacterBuffs(useCharacter)
 
     characterSettings.useCharacterBuffs = useCharacter and true or false
     loadWatchedBuffs()
-    pcall(function() api.SaveSettings() end)
+    Store.Save()
     return true
 end
 
@@ -544,7 +552,7 @@ function BuffSettingsWindow.PromoteCharacterBuffsToGlobal()
         globalSettings[key] = promoted
     end
 
-    pcall(function() api.SaveSettings() end)
+    Store.Save()
     return true
 end
 
@@ -572,7 +580,7 @@ function BuffSettingsWindow.CopyGlobalBuffsToCharacter()
         loadWatchedBuffs()
     end
 
-    pcall(function() api.SaveSettings() end)
+    Store.Save()
     return true
 end
 
@@ -1245,7 +1253,7 @@ local function showInfoCard()
         local root = ensureRoot()
         if root then
             root.infoCardSeen = true
-            pcall(function() api.SaveSettings() end)
+            Store.Save()
         end
     end)
 

@@ -16,3 +16,6 @@ watchlist_export.txt
 anchor_trace*.txt
 zoom_trace.txt
 static_buff_list.lua.backup
+
+# Generated for pasting into Discord (see tools/discord-readme.py)
+README-discord.txt

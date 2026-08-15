@@ -2,6 +2,56 @@ local api = require("api")
 local BuffSettingsWindow = require("TrackThatPlease/buff_settings_wnd")
 local helpers = require("TrackThatPlease/util/helpers")
 local BuffsLogger = require("TrackThatPlease/util/buff_logger")
+local Store = require("TrackThatPlease/util/settings_store")
+
+-- ========================= UI-scale space model ==============================
+-- This build is the shipped 3.0 with exactly three grafts - the UI-scale
+-- sizing fix, the outline fix, and the private settings store - and nothing
+-- else: every runtime system (positioning, calibration, anchoring, gates)
+-- is 3.0 byte-for-byte.
+--
+-- The client scales the whole UI tree by one factor (UIParent:GetUIScale());
+-- every anchor offset and extent is in UI units, but GetScreenWidth/
+-- GetScreenHeight return DEVICE pixels. The client's own code divides
+-- whenever a screen dimension meets an anchor or extent
+-- (globalui/loading/loading_view.lua:96, x2ui/baselib/ui_management.lua:129,
+-- both via CalcDontApplyUIScale); the projection functions already return
+-- anchor-space values. Mixing the two spaces is what shifted the
+-- nametag-mode bar HARD at any UI scale other than 100. Read live on every
+-- use, never cached at load: the option's scale is not in effect yet while
+-- addons load, and the player can change it mid-session. The old per-scale
+-- nudge table this replaces was a band-aid over the same space mix.
+local function GetUIScaleSafe()
+    local scale = api.Interface:GetUIScale()
+    if type(scale) ~= "number" or scale <= 0 then return 1 end
+    return scale
+end
+local function ScreenUIWidth()
+    return api.Interface:GetScreenWidth() / GetUIScaleSafe()
+end
+local function ScreenUIHeight()
+    return api.Interface:GetScreenHeight() / GetUIScaleSafe()
+end
+
+-- Fix a size in DEVICE pixels (the client's CalcDontApplyUIScale arithmetic,
+-- BetterBars' Px rule): the buff bars are a world overlay, so icon size 30
+-- means the same 30 screen pixels at 80% and at 160%. Identity at 100%.
+local function Px(n)
+    return n / GetUIScaleSafe()
+end
+
+-- NaN/Inf frame guard, the fourth and final graft. The screen-projection
+-- functions can return NaN or Inf for a frame when the unit mounts or
+-- dismounts (reported by Draygo, 2026-08-10). NaN passes a plain truthy
+-- check, and one poisoned sample corrupts every running average it touches
+-- permanently (x + NaN is NaN forever) - the nametag calibration would
+-- never recover for the rest of the session. Rejecting the frame instead
+-- holds the bar at its last good position until the reading recovers.
+local function isFiniteNumber(n)
+    return type(n) == "number" and n == n
+        and n ~= math.huge and n ~= -math.huge
+end
+-- =============================================================================
 
 -- Addon Information
 local TargetBuffTrackerAddon = {
@@ -28,7 +78,6 @@ local previousPlayerXYZString = "0,0,0"
 local previousPlayerXYZSmothed = {x = 0, y = 0, z = 0}
 local previousTargetXYZString = "0,0,0"
 local previousTargetXYZSmothed = {x = 0, y = 0, z = 0}
-local uiScale
 local staleHideHandler
 local lastPlayerBuffSig = ""
 local lastTargetBuffSig = ""
@@ -123,9 +172,21 @@ local nametagStuckMs = 0
 -- The gate is what keeps jumps out: during a jump the fast (200ms) and slow
 -- (660ms) averages diverge far past it and correction suspends itself, so the
 -- bar still freezes for jumps and abrupt skills. Ungated, a jump leaked 10.5px.
-local NAMETAG_DRIFT_AVG_SPEED = 1.5
+-- 2.5, up from the shipped 1.5 (field-tuned 2026-08-15): this is the slow
+-- average the drift correction CHASES, and at ~660ms of lag it had become
+-- the bottleneck once the correction itself was sped to 7 - the fast
+-- correction spent its first ~0.7s chasing a target still in transit. At
+-- 2.5 the target arrives in ~400ms and the whole small-residue reposition
+-- lands in about half a second end to end. Watch-item: the jump gate below
+-- compares the fast (200ms) and THIS average - going much faster shrinks
+-- their mid-jump divergence toward the 12px gate and jumps could start
+-- leaking pixels into the drift path.
+local NAMETAG_DRIFT_AVG_SPEED = 2.5
 local NAMETAG_DRIFT_PX = 2
-local NAMETAG_DRIFT_SPEED = 1.5
+-- 7, up from the shipped 1.5 (field-tuned 2026-08-15, via 3 and 5): the
+-- correction settles a residue in ~0.2s - effectively a soft snap. Safe to
+-- raise: the GATE above is what keeps jumps out of this path, not the speed.
+local NAMETAG_DRIFT_SPEED = 7
 local NAMETAG_DRIFT_GATE_PX = 12
 local nametagDriftAvg
 
@@ -204,7 +265,7 @@ local function CreateBuffElement(index, canvas)
     local icon = CreateItemIconButton("buffIcon" .. index, canvas)
     F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
     icon:Clickable(false)
-    icon:SetExtent(BuffSettingsWindow.settings.iconSize, BuffSettingsWindow.settings.iconSize)
+    icon:SetExtent(Px(BuffSettingsWindow.settings.iconSize), Px(BuffSettingsWindow.settings.iconSize))
     icon:Show(false)
 
     -- Create a border around the icon.
@@ -212,35 +273,41 @@ local function CreateBuffElement(index, canvas)
     -- (old approach) the drawable stretches between them, and because the buff
     -- canvas is re-anchored every frame the two points can momentarily resolve
     -- to different screen positions - producing giant bars across the screen.
-    local borderSize = 1
-
-    -- Top border
     local topBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    topBorder:AddAnchor("BOTTOMLEFT", icon, "TOPLEFT", -borderSize, 0)
     icon.topBorder = topBorder
-
-    -- Bottom border
     local bottomBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    bottomBorder:AddAnchor("TOPLEFT", icon, "BOTTOMLEFT", -borderSize, 0)
     icon.bottomBorder = bottomBorder
-
-    -- Left border
     local leftBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    leftBorder:AddAnchor("TOPRIGHT", icon, "TOPLEFT", 0, -borderSize)
     icon.leftBorder = leftBorder
-
-    -- Right border
     local rightBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    rightBorder:AddAnchor("TOPLEFT", icon, "TOPRIGHT", 0, -borderSize)
     icon.rightBorder = rightBorder
 
-    -- Size the borders to the icon; must be re-run whenever the icon extent changes
+    -- Size AND anchor the borders to the icon; re-run whenever the icon extent
+    -- changes. The border is one DEVICE pixel (Px), not one UI unit: at 85%
+    -- scale a 1-unit line is 0.85 device pixels and rasterises to nothing
+    -- along part of its length. Anchoring lives here too (still one anchor
+    -- per drawable), because the inset must match the live border thickness.
+    --
+    -- Corner-free layout: top and bottom span the full outline width
+    -- (w + 2b); left and right fill only the icon's own height between them.
+    -- The old h + 2b verticals overlapped the horizontals in all four corner
+    -- squares, and at 0.6 alpha a double-drawn corner composites to 0.84 -
+    -- every icon wore four darker dots.
     function icon:UpdateBorderSize()
+        local b = Px(1)
         local w, h = self:GetWidth(), self:GetHeight()
-        self.topBorder:SetExtent(w + borderSize * 2, borderSize)
-        self.bottomBorder:SetExtent(w + borderSize * 2, borderSize)
-        self.leftBorder:SetExtent(borderSize, h + borderSize * 2)
-        self.rightBorder:SetExtent(borderSize, h + borderSize * 2)
+        self.topBorder:RemoveAllAnchors()
+        self.topBorder:AddAnchor("BOTTOMLEFT", self, "TOPLEFT", -b, 0)
+        self.bottomBorder:RemoveAllAnchors()
+        self.bottomBorder:AddAnchor("TOPLEFT", self, "BOTTOMLEFT", -b, 0)
+        self.leftBorder:RemoveAllAnchors()
+        self.leftBorder:AddAnchor("TOPRIGHT", self, "TOPLEFT", 0, 0)
+        self.rightBorder:RemoveAllAnchors()
+        self.rightBorder:AddAnchor("TOPLEFT", self, "TOPRIGHT", 0, 0)
+        self.topBorder:SetExtent(w + b * 2, b)
+        self.bottomBorder:SetExtent(w + b * 2, b)
+        self.leftBorder:SetExtent(b, h)
+        self.rightBorder:SetExtent(b, h)
     end
     icon:UpdateBorderSize()
 
@@ -258,7 +325,7 @@ local function CreateBuffElement(index, canvas)
     timeLabel = canvas:CreateChildWidget("label", "buffTimeLeftLabel" .. index, 0, true)
     timeLabel:SetText("")
     timeLabel:AddAnchor("CENTER", icon, "CENTER", 0, 0)
-    timeLabel.style:SetFontSize(BuffSettingsWindow.settings.fontSize)
+    timeLabel.style:SetFontSize(Px(BuffSettingsWindow.settings.fontSize))
     --timeLabel.style:SetFont("ui/font/yoon_firedgothic_b.ttf", BuffSettingsWindow.settings.fontSize)
     timeLabel.style:SetAlign(ALIGN.CENTER)
     timeLabel.style:SetShadow(true)
@@ -267,9 +334,9 @@ local function CreateBuffElement(index, canvas)
     timeLabel.style:SetColor(1, 1, 1, 1)
 
     local stackLabel = canvas:CreateChildWidget("label", "buffStackLabel" .. index, 0, true)
-    local stackFontSize = math.floor(BuffSettingsWindow.settings.fontSize * 0.65 + 0.5)
+    local stackFontSize = Px(math.floor(BuffSettingsWindow.settings.fontSize * 0.65 + 0.5))
     stackLabel:SetText("")
-    stackLabel:AddAnchor("TOPLEFT", icon, "TOPLEFT", 2, 6)
+    stackLabel:AddAnchor("TOPLEFT", icon, "TOPLEFT", Px(2), Px(6))
     -- ui/font/SD_LeeyagiL.ttf
     -- ui/font/yoon_firedgothic_b.ttf
     --stackLabel.style:SetFont("ui/font/yoon_firedgothic_b.ttf", BuffSettingsWindow.settings.fontSize - 4) -- another font for stacks
@@ -288,10 +355,13 @@ end
 -- Function to position buffs with whole bar centered
 local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels)
     local maxBuffsToDisplay = math.min(#watchedBuffs, BuffSettingsWindow.settings.maxBuffsShown)
-    local iconSize = BuffSettingsWindow.settings.iconSize
-    local iconSpacing = BuffSettingsWindow.settings.iconSpacing
-    local fontSize = BuffSettingsWindow.settings.fontSize
-    
+    -- Device pixels (Px): the sliders' numbers mean on-screen pixels at every
+    -- UI scale. Layout is otherwise exactly 3.0 (CENTER-anchored icons).
+    local iconSize = Px(BuffSettingsWindow.settings.iconSize)
+    local iconSpacing = Px(BuffSettingsWindow.settings.iconSpacing)
+    local fontSize = Px(BuffSettingsWindow.settings.fontSize)
+    local stackFontSize = Px(BuffSettingsWindow.settings.fontSize - 3)
+
     local newWidth = iconSize * maxBuffsToDisplay + (maxBuffsToDisplay - 1) * iconSpacing
     local newHeight = iconSize
 
@@ -299,7 +369,7 @@ local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels)
     canvas:SetExtent(newWidth, newHeight)
 
     local startX = -newWidth / 2 + iconSize / 2
-    
+
     for i = 1, maxBuffsToDisplay do
         local icon = icons[i]
         local offsetX = startX + (i - 1) * (iconSize + iconSpacing)
@@ -307,24 +377,16 @@ local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels)
         local stackLabel = stackLabels[i]
 
         label.style:SetFontSize(fontSize)
-        stackLabel.style:SetFontSize(fontSize - 3) -- Update stack label font size
+        stackLabel.style:SetFontSize(stackFontSize) -- Update stack label font size
+        -- The stack label's inset is device-fixed too, and its creation-time
+        -- anchor was laid at load, when the scale is not yet readable
+        stackLabel:RemoveAllAnchors()
+        stackLabel:AddAnchor("TOPLEFT", icon, "TOPLEFT", Px(2), Px(6))
         icon:SetExtent(iconSize, iconSize)
         icon:UpdateBorderSize()
         icon:RemoveAllAnchors()
         icon:AddAnchor("CENTER", canvas, "CENTER", offsetX, 0)
     end
-end
-
--- Function to get position adjustments based on UI scale
-local function GetPositionAdjustment()
-    local adjustments = {
-        [80] = { x = 0, y = -6 },
-        [90] = { x = 0, y = -3 },
-        [100] = { x = 0, y = 0 },
-        [110] = { x = 0, y = 3 },
-        [120] = { x = 0, y = 6 },
-    }
-    return adjustments[uiScale] or { x = 0, y = 0 }
 end
 
 -- Function to collect all watched buffs and debuffs
@@ -426,10 +488,12 @@ local function ApplyBuffSkins(buffs, icons, maxBuffsToDisplay)
     end
 end
 
--- Signature of what is currently displayed; anchor/skin work reruns only when it changes
+-- Signature of what is currently displayed; anchor/skin work reruns only when it changes.
+-- The live UI scale is part of it: geometry is in device pixels now, so a
+-- mid-session scale change must re-lay-out even though no setting changed.
 local function BuildBuffSignature(buffs, maxBuffsToDisplay)
     local s = BuffSettingsWindow.settings
-    local parts = { s.iconSize, s.iconSpacing, s.fontSize, s.maxBuffsShown }
+    local parts = { s.iconSize, s.iconSpacing, s.fontSize, s.maxBuffsShown, GetUIScaleSafe() }
     for i = 1, maxBuffsToDisplay do
         parts[#parts + 1] = buffs[i].buff_id or 0
         parts[#parts + 1] = buffs[i].isBuff and 1 or 0
@@ -557,7 +621,7 @@ local function UpdateBuffsPosition(unitType, dt)
 
     local x, y, z = api.Unit:GetUnitScreenPosition(unitType)
 
-    if x and y and z then
+    if isFiniteNumber(x) and isFiniteNumber(y) and isFiniteNumber(z) then
         local currentPos = {x = x, y = y, z = z}
 
         -- Nameplate compensation. Fixed mode has already returned above, so
@@ -573,7 +637,7 @@ local function UpdateBuffsPosition(unitType, dt)
         -- (Idle head height measured ~727 on a 1440 screen, so half-height is
         -- within a few px; the offset slider absorbs the difference.)
         if unitType == "player" and s.nametagEnabled == true then
-            currentPos.x = api.Interface:GetScreenWidth() / 2
+            currentPos.x = ScreenUIWidth() / 2
 
             -- Y is pinned too, but a constant would sit wrong once the camera
             -- zooms: the character grows on screen as it nears, so the bar has to
@@ -595,7 +659,7 @@ local function UpdateBuffsPosition(unitType, dt)
                 -- reading updates nothing - the bar holds its last good height
                 -- until the game's own anchor recovers
                 local plausible = currentPos.z <= NAMETAG_PLAUSIBLE_MIN_Z
-                    or rawY > api.Interface:GetScreenHeight() * NAMETAG_PLAUSIBLE_TOP
+                    or rawY > ScreenUIHeight() * NAMETAG_PLAUSIBLE_TOP
 
                 -- Any camera motion this frame, or enough accumulated drift,
                 -- opens the settling window (see the constants above)
@@ -673,7 +737,7 @@ local function UpdateBuffsPosition(unitType, dt)
 
                 currentPos.y = nametagCalibY
             else
-                currentPos.y = api.Interface:GetScreenHeight() / 2
+                currentPos.y = ScreenUIHeight() / 2
             end
         end
 
@@ -695,12 +759,15 @@ local function UpdateBuffsPosition(unitType, dt)
         -- less jitter on the player bar; nameplate compensation removes the
         -- jitter at its source instead, so there is nothing left to smooth.
         local smoothPos = currentPos
-        local adjustment = GetPositionAdjustment()
 
         -- Snap to whole pixels and re-anchor only on >= 1px movement:
-        -- sub-pixel anchor churn is what caused the constant shimmer
-        local ax = math.floor(smoothPos.x + adjustment.x + 0.5)
-        local ay = math.floor(smoothPos.y + baseOffsetY + adjustment.y + 0.5)
+        -- sub-pixel anchor churn is what caused the constant shimmer.
+        -- 3.0 anchoring otherwise untouched; the only sizing grafts here are
+        -- the offset slider meaning DEVICE pixels (identity at 100%) and the
+        -- removal of the per-scale nudge table, which was a band-aid over
+        -- the space mix the ScreenUI* pins above now fix at the source.
+        local ax = math.floor(smoothPos.x + 0.5)
+        local ay = math.floor(smoothPos.y + Px(baseOffsetY) + 0.5)
 
         -- Reject positions that are off screen BEFORE anchoring to them.
         -- GetUnitScreenPosition's projection blows up as a unit approaches the
@@ -714,9 +781,9 @@ local function UpdateBuffsPosition(unitType, dt)
         canvasW = canvasW or 0
         canvasH = canvasH or 0
         local onScreen = ax > -canvasW
-            and ax < api.Interface:GetScreenWidth() + canvasW
+            and ax < ScreenUIWidth() + canvasW
             and ay > -canvasH
-            and ay < api.Interface:GetScreenHeight() + canvasH
+            and ay < ScreenUIHeight() + canvasH
         if not onScreen then
             canvas:Show(false)
             return
@@ -1126,17 +1193,17 @@ local function OnLoad()
     -- load setttings------------------------
     BuffsLogger.Initialize()
     BuffSettingsWindow.Initialize(BuffsLogger)
-
-    uiScale = math.floor(BuffSettingsWindow.settings.UIScale * 100 + 0.5)
     -------------------------------------
 
     playerBuffCanvas = api.Interface:CreateEmptyWindow("playerBuffCanvas")
-    playerBuffCanvas:SetExtent(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing, BuffSettingsWindow.settings.iconSize)
+    -- Px is best effort here (the scale is not readable at load time); the
+    -- first PositionBuffs pass re-sizes with the real scale
+    playerBuffCanvas:SetExtent(Px(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing), Px(BuffSettingsWindow.settings.iconSize))
     playerBuffCanvas:Show(false)
     playerBuffCanvas:Clickable(false)
-    
+
     targetBuffCanvas = api.Interface:CreateEmptyWindow("targetBuffCanvas")
-    targetBuffCanvas:SetExtent(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing, BuffSettingsWindow.settings.iconSize)
+    targetBuffCanvas:SetExtent(Px(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing), Px(BuffSettingsWindow.settings.iconSize))
     targetBuffCanvas:Show(false)
     targetBuffCanvas:Clickable(false)
     
@@ -1181,10 +1248,10 @@ local function OnLoad()
     -- to FindWidget, so a fresh instance cannot find the old HUD. Each load bumps
     -- a session counter; a HUD born under an older counter hides and unregisters
     -- itself on its next UPDATE tick.
-    local root = api.GetSettings("TrackThatPlease") or {}
+    local root = Store.Root()
     root.hudSession = (root.hudSession or 0) + 1
     local mySession = root.hudSession
-    pcall(function() api.SaveSettings() end)
+    Store.Save()
 
     local hudWidgets = { playerBuffCanvas, targetBuffCanvas }
     if BuffSettingsWindow.GetWindow then
@@ -1192,7 +1259,7 @@ local function OnLoad()
         if settingsWnd then table.insert(hudWidgets, settingsWnd) end
     end
     staleHideHandler = function()
-        local r = api.GetSettings("TrackThatPlease") or {}
+        local r = Store.Root()
         if (r.hudSession or 0) == mySession then return end
         for _, w in ipairs(hudWidgets) do
             pcall(function() w:Show(false) end)
@@ -1226,6 +1293,18 @@ local function OnLoad()
                 BuffSettingsWindow.ToggleBuffSelectionWindow()
             end)
         end
+    end)
+
+    -- Native ESCMenu registration (the queue is read by the ESCMenu addon's
+    -- two-phase loader; safe no-op when ESCMenu is not installed)
+    pcall(function()
+        ESCMenu = ESCMenu or {}
+        ESCMenu.queue = ESCMenu.queue or {}
+        table.insert(ESCMenu.queue, {
+            name = "TrackThatPlease",
+            callback = function() BuffSettingsWindow.ToggleBuffSelectionWindow() end,
+            category = "Combat",
+        })
     end)
 
     api.Log:Info("TrackThatPlease had been loaded. Open it from the ESC menu (Addon Options), \n the addon manager, or by typing - ttp - in chat")

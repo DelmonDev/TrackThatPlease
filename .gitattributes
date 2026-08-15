@@ -1,0 +1,5 @@
+# Repo-only: git archive builds the release zip, and these are not part
+# of the addon a player installs.
+tools/ export-ignore
+.gitattributes export-ignore
+.gitignore export-ignore

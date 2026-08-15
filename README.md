@@ -11,6 +11,29 @@ default frames to find out whether your buff is still up.
 
 ---
 
+## What's new in 3.1
+
+- **UI-scale fix** — the bars now look and sit the same at every UI scale (the
+  client offers 40–160% now). Before, the bar shifted hard away from your
+  character when the scale wasn't 100 and the nametag toggle was on, and the
+  icon size and vertical offset grew and shrank with the scale option. The
+  screen math mixed device pixels with the UI's own coordinate space; it now
+  converts the way the client itself does, and the bar geometry — icon size,
+  spacing, text, borders, offsets — is fixed in on-screen pixels, so "icon
+  size 30" means the same 30 pixels at 80% and at 160%. The old per-scale
+  nudge table and the stored `UIScale` value are gone, and a stray NaN from
+  the game's screen-projection during mount/dismount can no longer glitch the
+  bar's position tracking.
+- **Crash-proof settings** — your configuration now lives in its own file pair
+  (`TrackThatPlease_settings.lua` plus a backup mirror, next to the game's
+  `addon_settings` file) instead of the shared store that every addon writes.
+  A client crash could truncate that shared file mid-write, and the game then
+  silently reset **every** addon to defaults on the next launch.
+  TrackThatPlease now survives that: it restores from its own files, heals a
+  corrupted copy from the mirror, and migrates your existing settings
+  (any schema version) automatically on first launch. Your watched lists also
+  now survive addon updates and reinstalls.
+
 ## Install
 
 1. Download the latest release and extract it into `Documents/AAClassic/Addon/`.
