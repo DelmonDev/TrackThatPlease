@@ -10,7 +10,7 @@ BuffSettingsWindow.settings = {}
 BuffSettingsWindow.MAX_BUFFS_COUNT = 13
 -- Single source for the version: main.lua's addon table and the settings-window
 -- footer both read this, so they cannot disagree.
-BuffSettingsWindow.ADDON_VERSION = "3.1"
+BuffSettingsWindow.ADDON_VERSION = "3.2"
 -- Blinking "recording" indicator shown left of the logging button
 local RECORDING_ICON_PATH = "../Addon/TrackThatPlease/icons/rec-button.png"
 
@@ -61,12 +61,16 @@ local LEGACY_DEAD_KEYS = {
 local SETTING_CLAMPS = {
     fontSize = { 10, 36 },
     iconSize = { 25, 58 },
+    targetIconSize = { 25, 58 },
+    staticIconSize = { 25, 58 },
     iconSpacing = { 1, 10 },
     maxBuffsShown = { 3, BuffSettingsWindow.MAX_BUFFS_COUNT },
     buffWarnTime = { 0, 10000 },
     debuffWarnTime = { 0, 10000 },
-    playerBuffVerticalOffset = { -60, -20 },
-    targetBuffVerticalOffset = { -60, -20 },
+    -- Positive values sit the bar BELOW the head anchor; the old -60..-20 band
+    -- only allowed heights above it
+    playerBuffVerticalOffset = { -100, 100 },
+    targetBuffVerticalOffset = { -100, 100 },
 }
 
 local function clampNumber(value, minValue, maxValue)
@@ -83,23 +87,60 @@ local function uiScaleOrOne()
     return uiScale
 end
 
--- Keeps a saved widget position reachable. Old files store floats and can pin a
--- widget to the very screen edge (btnSettingsPos = {1676.29, -0.0101827}), which
--- leaves the settings button unclickable.
---
--- Positions are anchor offsets (UI units) but GetScreenWidth/Height return
--- DEVICE pixels, so the bounds are divided by the live UI scale - see the
--- space helpers in main.lua. Best effort at load time; main.lua re-clamps
--- fixed-bar positions at apply time with the real scale.
-local function clampPosition(pos, widgetWidth, widgetHeight)
-    local screenWidth = api.Interface:GetScreenWidth() / uiScaleOrOne()
-    local screenHeight = api.Interface:GetScreenHeight() / uiScaleOrOne()
-    local x = tonumber(pos and pos[1]) or 0
-    local y = tonumber(pos and pos[2]) or 0
-    x = clampNumber(x, 0, math.max(0, screenWidth - widgetWidth))
-    y = clampNumber(y, 0, math.max(0, screenHeight - widgetHeight))
-    return { math.floor(x + 0.5), math.floor(y + 0.5) }
+-- Fix a size in DEVICE pixels (main.lua's Px rule; the reasoning lives in
+-- BetterBars' UI_SCALING.md): a thin line built from a colour drawable must
+-- not scale, or at 85% a 1-unit line is 0.85 device pixels and rasterises to
+-- nothing along part of its length. Identity at 100%. Read live on every use,
+-- never cached at load: the option's scale is not readable while addons load.
+local function Px(n)
+    return n / uiScaleOrOne()
 end
+
+-- ===================== Live-scale line geometry ==============================
+-- Every thin line in this window - border+fill rings, checkbox rings, slider
+-- fills, header strips, the triangle glyphs - must be laid in DEVICE pixels
+-- (UI_SCALING.md), but the window is built at OnLoad, when the scale still
+-- reads 1, so every build-time thickness is provisional. Each construct
+-- registers a refresher; RefreshPxGeometry re-runs them with the live scale
+-- when the window or the info card is shown and the scale has changed since
+-- the last pass. (The buff-list rows do the same per fill through
+-- UpdatePxGeometry.) Registration runs the refresher once immediately, so
+-- anything built AFTER load - the info card - is correct from creation.
+local pxRefreshers = {}
+local lastPxScale = 0
+local function RegisterPxRefresher(fn)
+    table.insert(pxRefreshers, fn)
+    pcall(fn)
+end
+local function RefreshPxGeometry()
+    local scale = uiScaleOrOne()
+    if scale == lastPxScale then return end
+    lastPxScale = scale
+    for _, fn in ipairs(pxRefreshers) do
+        pcall(fn)
+    end
+end
+-- The commonest shape: a fill sitting one device pixel inside its parent so
+-- the parent's border drawable shows as a one-pixel ring. extendRight
+-- preserves the scrollbar's engine-rounding extension (see TRACK_RIGHT_EXTEND).
+local function RegisterPxInset(fill, parent, extendRight)
+    local ext = extendRight or 0
+    RegisterPxRefresher(function()
+        local b = Px(1)
+        fill:RemoveAllAnchors()
+        fill:AddAnchor("TOPLEFT", parent, b, b)
+        fill:AddAnchor("BOTTOMRIGHT", parent, ext - b, -b)
+    end)
+end
+
+-- Saved fixed-bar positions (playerBarPos, staticBarPos) are deliberately NOT
+-- clamped here. They are raw DEVICE-pixel effective offsets (skill
+-- ui-toolkit.md: what you persist after a drag); main.lua clamps them at
+-- APPLY time in device space and performs the single device->units division
+-- right at the AddAnchor call (anchor offsets are UI units - see
+-- ClampToScreen's note there). A clamp here once divided the screen bounds
+-- by the scale, which pulled correctly placed bars toward the top-left on
+-- the next login ("the bar moves on reload").
 
 local function getCurrentCharacterKey()
     local playerId = api.Unit:GetUnitId("player")
@@ -285,9 +326,12 @@ local recordAllButton
 -- Settings
 local playerWatchedBuffs = {}
 local targetWatchedBuffs = {}
+-- The static bar's own list. Fully independent of the player list: the same
+-- buff can be on both, or on either alone.
+local staticWatchedBuffs = {}
 
 local filteredBuffs = {}
-local currentTrackType = 1  -- 1 = Player, 2 = Target, 3 = Both
+local currentTrackType = 1  -- 1 = Player, 2 = Target, 3 = Both, 4 = Static bar
 local isSelectedAll = false
 
 local buffScrollListWidth
@@ -295,12 +339,14 @@ local buffScrollListWidth
 -- Scroll and pagination
 local pageSize = 50
 local categories = {"All static buffs", "All logged buffs", "Watched buffs"}
-local trackTypes = {"Player", "Target", "Both"}
+local trackTypes = {"Player", "Target", "Both", "Static bar"}
 local TRACK_TYPE_PLAYER = 1
 local TRACK_TYPE_TARGET = 2
 -- "Both" keeps the two lists separate on disk and applies every action to each
--- of them; a buff counts as watched only when it is on both.
+-- of them; a buff counts as watched only when it is on both. It spans Player
+-- and Target only - the static bar's list is always addressed on its own.
 local TRACK_TYPE_BOTH = 3
+local TRACK_TYPE_STATIC = 4
 -- Category types
 local CATEGORY_TYPE_ALL = 1
 local CATEGORY_TYPE_LOGGED = 2
@@ -326,6 +372,7 @@ function BuffSettingsWindow.SaveSettings()
     -- without it reappearing as tracked.
     local serializedPlayerBuffs, serializedPlayerDisabled = {}, {}
     local serializedTargetBuffs, serializedTargetDisabled = {}, {}
+    local serializedStaticBuffs, serializedStaticDisabled = {}, {}
 
     for buffId, enabled in pairs(playerWatchedBuffs) do
         table.insert(enabled and serializedPlayerBuffs or serializedPlayerDisabled,
@@ -334,6 +381,11 @@ function BuffSettingsWindow.SaveSettings()
 
     for buffId, enabled in pairs(targetWatchedBuffs) do
         table.insert(enabled and serializedTargetBuffs or serializedTargetDisabled,
+            SerializeNumber(buffId))
+    end
+
+    for buffId, enabled in pairs(staticWatchedBuffs) do
+        table.insert(enabled and serializedStaticBuffs or serializedStaticDisabled,
             SerializeNumber(buffId))
     end
 
@@ -354,6 +406,8 @@ function BuffSettingsWindow.SaveSettings()
         bucket.targetWatchedBuffs = serializedTargetBuffs
         bucket.playerDisabledBuffs = serializedPlayerDisabled
         bucket.targetDisabledBuffs = serializedTargetDisabled
+        bucket.staticWatchedBuffs = serializedStaticBuffs
+        bucket.staticDisabledBuffs = serializedStaticDisabled
     end
 
 
@@ -391,7 +445,11 @@ local function buildDefaultSettings()
         fontSize = 16,
         targetBuffVerticalOffset = -46,
         playerBuffVerticalOffset = -46,
+        -- iconSize is the PLAYER bars' size (kept under its old name so
+        -- existing files load unchanged); the target bar has its own. The
+        -- static bar is a player bar, so it follows iconSize.
         iconSize = 30,
+        targetIconSize = 30,
         iconSpacing = 5,
         maxBuffsShown = 10,
         debuffWarnTime = 7000,
@@ -406,12 +464,22 @@ local function buildDefaultSettings()
         -- not there for them, and leaving it on is a small regression.
         nametagEnabled = true,
         playerBarMode = "head", -- "head" follows the character; "fixed" pins to screen
-        -- Anchor space, so the device dimensions are divided by the UI scale.
-        -- Best effort: the scale is not readable at load time (falls back to
-        -- 1); the apply-time clamp in main.lua pulls a default that landed
-        -- off screen back into view once the real scale is known.
-        playerBarPos = { math.floor((api.Interface:GetScreenWidth() / 2) / uiScaleOrOne() - 80),
-                         math.floor((api.Interface:GetScreenHeight() * 0.6) / uiScaleOrOne()) },
+        -- Raw DEVICE pixels, the same space the persisted drag offsets use;
+        -- main.lua converts device->units once, at the AddAnchor call (see
+        -- ClampToScreen's note). Screen dims are readable at load, so no
+        -- load-time caveat here.
+        playerBarPos = { math.floor(api.Interface:GetScreenWidth() / 2 - 80),
+                         math.floor(api.Interface:GetScreenHeight() * 0.6) },
+        -- The second, always-fixed player bar. Off by default; its list starts
+        -- empty, so even enabled it shows nothing until buffs are added to it.
+        staticBarEnabled = false,
+        -- Its own icon size (the slider lives in the Configure popup); the
+        -- other display settings stay shared with the main bars
+        staticIconSize = 30,
+        -- Below the default playerBarPos so the two do not stack when both
+        -- are first placed. Same device space as playerBarPos.
+        staticBarPos = { math.floor(api.Interface:GetScreenWidth() / 2 - 80),
+                         math.floor(api.Interface:GetScreenHeight() * 0.7) },
     }
 end
 
@@ -436,7 +504,8 @@ local function applyClamps(settings)
             settings[key] = clampNumber(settings[key], range[1], range[2])
         end
     end
-    settings.playerBarPos = clampPosition(settings.playerBarPos, 160, 40)
+    -- playerBarPos/staticBarPos: clamped at apply time in main.lua, see the
+    -- note above getCurrentCharacterKey
 end
 
 -- Reads the watched lists out of whichever bucket is active for this character.
@@ -465,6 +534,10 @@ local function loadWatchedBuffs()
 
     targetWatchedBuffs = {}
     fill(targetWatchedBuffs, "targetWatchedBuffs", "targetDisabledBuffs")
+
+    -- Absent in every pre-static file, so this loads as an empty list there
+    staticWatchedBuffs = {}
+    fill(staticWatchedBuffs, "staticWatchedBuffs", "staticDisabledBuffs")
 end
 
 -- Display settings are global, so they load immediately. Only the watched lists
@@ -492,6 +565,14 @@ loadSettings = function()
     for k, defaultValue in pairs(defaultSettings) do
         BuffSettingsWindow.settings[k] = ensureType(globalSettings[k], defaultValue)
     end
+
+    -- Files from before the player/target size split carry only iconSize. Seed
+    -- the target size from it rather than the default, so a player who ran
+    -- icon size 35 keeps a 35 target bar instead of it snapping back to 30.
+    if globalSettings.targetIconSize == nil then
+        BuffSettingsWindow.settings.targetIconSize = BuffSettingsWindow.settings.iconSize
+    end
+
     applyClamps(BuffSettingsWindow.settings)
 
     loadWatchedBuffs()
@@ -516,7 +597,8 @@ function BuffSettingsWindow.SetUseCharacterBuffs(useCharacter)
     if useCharacter and characterSettings.playerWatchedBuffs == nil
         and characterSettings.targetWatchedBuffs == nil then
         for _, key in ipairs({ "playerWatchedBuffs", "targetWatchedBuffs",
-                               "playerDisabledBuffs", "targetDisabledBuffs" }) do
+                               "playerDisabledBuffs", "targetDisabledBuffs",
+                               "staticWatchedBuffs", "staticDisabledBuffs" }) do
             local seed = {}
             for _, id in ipairs(globalSettings[key] or {}) do
                 table.insert(seed, id)
@@ -544,7 +626,8 @@ function BuffSettingsWindow.PromoteCharacterBuffsToGlobal()
     BuffSettingsWindow.SaveSettings()
 
     for _, key in ipairs({ "playerWatchedBuffs", "targetWatchedBuffs",
-                           "playerDisabledBuffs", "targetDisabledBuffs" }) do
+                           "playerDisabledBuffs", "targetDisabledBuffs",
+                           "staticWatchedBuffs", "staticDisabledBuffs" }) do
         local promoted = {}
         for _, id in ipairs(characterSettings[key] or {}) do
             table.insert(promoted, id)
@@ -567,7 +650,8 @@ function BuffSettingsWindow.CopyGlobalBuffsToCharacter()
     BuffSettingsWindow.SaveSettings()
 
     for _, key in ipairs({ "playerWatchedBuffs", "targetWatchedBuffs",
-                           "playerDisabledBuffs", "targetDisabledBuffs" }) do
+                           "playerDisabledBuffs", "targetDisabledBuffs",
+                           "staticWatchedBuffs", "staticDisabledBuffs" }) do
         local copied = {}
         for _, id in ipairs(globalSettings[key] or {}) do
             table.insert(copied, id)
@@ -615,21 +699,32 @@ function BuffSettingsWindow.ExportWatchedBuffs()
 
     -- Untracked-but-listed entries travel too, on their own lines, so a shared
     -- list arrives with the same layout the sender curated.
-    local playerIds, targetIds = {}, {}
-    local playerOff, targetOff = {}, {}
+    local playerIds, targetIds, staticIds = {}, {}, {}
+    local playerOff, targetOff, staticOff = {}, {}, {}
     for buffId, enabled in pairs(playerWatchedBuffs) do
         table.insert(enabled and playerIds or playerOff, SerializeNumber(buffId))
     end
     for buffId, enabled in pairs(targetWatchedBuffs) do
         table.insert(enabled and targetIds or targetOff, SerializeNumber(buffId))
     end
+    for buffId, enabled in pairs(staticWatchedBuffs) do
+        table.insert(enabled and staticIds or staticOff, SerializeNumber(buffId))
+    end
 
+    -- Still v1: the static lines are additive, and importers match section names
+    -- rather than counting lines, so a 3.1 build reads this file and simply
+    -- never looks at the static sections. Naming note: mergeSection matches
+    -- "<name>=" unanchored, so no section name may be another name with extra
+    -- characters glued on the FRONT ("mystatic=" would satisfy a "static="
+    -- match); suffixes like "staticoff" are safe because the "=" ends the match.
     local content = table.concat({
         "TTP-WATCHLIST v1",
         "player=" .. table.concat(playerIds, ","),
         "target=" .. table.concat(targetIds, ","),
         "playeroff=" .. table.concat(playerOff, ","),
         "targetoff=" .. table.concat(targetOff, ","),
+        "static=" .. table.concat(staticIds, ","),
+        "staticoff=" .. table.concat(staticOff, ","),
     }, "\n")
 
     -- Preserve whatever was there, so exporting over a received list is recoverable
@@ -676,6 +771,10 @@ function BuffSettingsWindow.ImportWatchedBuffs()
     local addedTarget = mergeSection("target", targetWatchedBuffs, true)
     addedPlayer = addedPlayer + mergeSection("playeroff", playerWatchedBuffs, false)
     addedTarget = addedTarget + mergeSection("targetoff", targetWatchedBuffs, false)
+    -- Static entries ride the player count for the summary message: files from
+    -- 3.1 and earlier simply have no static sections, so this adds zero there.
+    addedPlayer = addedPlayer + mergeSection("static", staticWatchedBuffs, true)
+    addedPlayer = addedPlayer + mergeSection("staticoff", staticWatchedBuffs, false)
 
     BuffSettingsWindow.SaveSettings()
     return addedPlayer, addedTarget
@@ -702,6 +801,8 @@ local function activeWatchSets()
         return { targetWatchedBuffs }
     elseif currentTrackType == TRACK_TYPE_BOTH then
         return { playerWatchedBuffs, targetWatchedBuffs }
+    elseif currentTrackType == TRACK_TYPE_STATIC then
+        return { staticWatchedBuffs }
     end
     return { playerWatchedBuffs }
 end
@@ -934,6 +1035,11 @@ end
 -- Set data for each buff item in the list
 local function DataSetFunc(subItem, data, setValue)
     if setValue then
+        -- Border thicknesses use the LIVE scale (see UpdatePxGeometry): row
+        -- creation ran at load, when the scale still reads 1, so the device-
+        -- pixel geometry is re-applied on every fill
+        if subItem.UpdatePxGeometry then subItem:UpdatePxGeometry() end
+
         local id = data.id
         subItem.id = id
         subItem.description = data.description
@@ -1000,19 +1106,18 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
     local subItemIcon = CreateItemIconButton("subItemIcon", subItem)
     subItemIcon:SetExtent(iconSize, iconSize)
     subItemIcon:Show(true)
-    F_SLOT.ApplySlotSkin(subItemIcon, subItemIcon.back, SLOT_STYLE.BUFF)
+    -- Skinless on purpose (dawnsdrop's icons prove CreateItemIconButton needs
+    -- no slot skin): the skin's pale frame scales in UI units and cannot be
+    -- recoloured, which forced the buff/debuff edges below to be a >=2-unit
+    -- COVER over it - the reason they went chunky above 100% scale. With no
+    -- skin there is nothing to cover, and the edges can be a true one device
+    -- pixel at every scale, the BetterBars discipline.
     subItemIcon:AddAnchor("LEFT", subItem, 5, 0)
 
     -- Buff/debuff border: four drawables on the overlay layer, each with a
-    -- single anchor and a fixed extent (the construction CreateBuffElement in
-    -- main.lua uses for the tracked bar icons). DataSetFunc sets the colour per
-    -- row; an unclassified row leaves them at alpha 0.
-    --
-    -- Placed ON the icon's outer ring rather than around it. The bar's version
-    -- sits outside its icon, but here the slot skin paints its own pale frame on
-    -- that edge and cannot be recoloured, so ringing the icon left both visible -
-    -- a coloured band around a white one. Covering the edge replaces it instead.
-    local borderSize = 2
+    -- single anchor and a fixed extent, laid ON the icon's edge. DataSetFunc
+    -- sets the colour per row; an unclassified row leaves them at alpha 0.
+    local borderSize = 1
     local function edge(point, w, h)
         local d = subItemIcon:CreateColorDrawable(1, 1, 1, 0, "overlay")
         d:SetExtent(w, h)
@@ -1124,6 +1229,46 @@ local function LayoutSetFunc(frame, rowIndex, colIndex, subItem)
         fillBuffData(buffScrollList, buffScrollList.curPageIdx or 1, searchEditBox:GetText())
     end
     removeBtn:SetHandler("OnClick", removeBtn.OnClick)
+
+    -- Device-pixel geometry (UI_SCALING.md rules). Everything above laid the
+    -- row out in UI units with 1-unit border rings and a 2-unit category
+    -- cover; this re-applies those thicknesses through the LIVE scale. It
+    -- cannot run just once here: rows are built at OnLoad, when the scale is
+    -- not yet readable (reads 1), so DataSetFunc re-runs it on every fill -
+    -- the window cannot become visible without one, and a mid-session scale
+    -- change is picked up on the next refresh the same way.
+    function subItem:UpdatePxGeometry()
+        local b = Px(1)
+
+        -- Row outline: outer rect stays in UI units (it is layout, anchored
+        -- to the row slot); the ring is held at one device pixel by insetting
+        -- the fill by the live Px(1) off the same offsets
+        bgFill:RemoveAllAnchors()
+        bgFill:AddAnchor("TOPLEFT", subItem, -70 + b, 4 + b)
+        bgFill:AddAnchor("BOTTOMRIGHT", subItem, -70 - b, -4 - b)
+
+        -- Buff/debuff edge: one device pixel at every scale. The old
+        -- max(Px(2), 2) sizing existed only to cover the slot skin's pale
+        -- frame, and the icon is skinless now (see LayoutSetFunc).
+        local t = Px(1)
+        subItem.catBorders[1]:SetExtent(iconSize, t)
+        subItem.catBorders[2]:SetExtent(iconSize, t)
+        subItem.catBorders[3]:SetExtent(t, iconSize)
+        subItem.catBorders[4]:SetExtent(t, iconSize)
+
+        -- Checkbox ring at one device pixel each side. The LEFT anchor
+        -- centres the fill vertically, so the shrunken height carries the
+        -- top/bottom ring on its own; only the x offset needs the inset.
+        checkFill:SetExtent(14 - 2 * b, 14 - 2 * b)
+        checkFill:RemoveAllAnchors()
+        checkFill:AddAnchor("LEFT", subItemIcon, "RIGHT", buffScrollListWidth - 145 + b, 0)
+
+        -- Remove-button ring, same treatment
+        removeFill:RemoveAllAnchors()
+        removeFill:AddAnchor("TOPLEFT", removeBtn, b, b)
+        removeFill:AddAnchor("BOTTOMRIGHT", removeBtn, -b, -b)
+    end
+    subItem:UpdatePxGeometry()
 end
 --============================ ### End ### ==============================--
 
@@ -1172,6 +1317,11 @@ function BuffSettingsWindow.IsTargetBuffWatched(buffId)
     return targetWatchedBuffs[buffId] == true
 end
 
+-- Check if a buff is on the static bar's list (main.lua's collection pass)
+function BuffSettingsWindow.IsStaticBuffWatched(buffId)
+    return staticWatchedBuffs[buffId] == true
+end
+
 -- Toggle the buff selection window visibility
 
 -- ===================================================================
@@ -1183,6 +1333,7 @@ end
 local infoCardWindow
 
 local function showInfoCard()
+    RefreshPxGeometry()
     if infoCardWindow then
         infoCardWindow:Show(true)
         return
@@ -1200,6 +1351,7 @@ local function showInfoCard()
     local body = infoCardWindow:CreateColorDrawable(0.06, 0.06, 0.068, 0.96, "background")
     body:AddAnchor("TOPLEFT", infoCardWindow, 1, 1)
     body:AddAnchor("BOTTOMRIGHT", infoCardWindow, -1, -1)
+    RegisterPxInset(body, infoCardWindow)
 
     local header = infoCardWindow:CreateColorDrawable(0.09, 0.09, 0.11, 0.98, "background")
     header:SetExtent(w - 2, 30)
@@ -1208,6 +1360,14 @@ local function showInfoCard()
     local accent = infoCardWindow:CreateColorDrawable(0, 0.75, 0.75, 0.85, "background")
     accent:SetExtent(4, 30)
     accent:AddAnchor("TOPLEFT", infoCardWindow, 1, 1)
+    RegisterPxRefresher(function()
+        local b = Px(1)
+        header:SetExtent(w - 2 * b, 30)
+        header:RemoveAllAnchors()
+        header:AddAnchor("TOPLEFT", infoCardWindow, b, b)
+        accent:RemoveAllAnchors()
+        accent:AddAnchor("TOPLEFT", infoCardWindow, b, b)
+    end)
 
     local function label(id, text, x, y, width, size, r, g, b)
         local l = infoCardWindow:CreateChildWidget("label", id, 0, true)
@@ -1240,6 +1400,7 @@ local function showInfoCard()
     local bFill = btn:CreateColorDrawable(0.16, 0.21, 0.30, 0.96, "background")
     bFill:AddAnchor("TOPLEFT", btn, 1, 1)
     bFill:AddAnchor("BOTTOMRIGHT", btn, -1, -1)
+    RegisterPxInset(bFill, btn)
     local bLabel = btn:CreateChildWidget("label", "ttpInfoCloseLbl", 0, true)
     bLabel:SetExtent(92, 14)
     bLabel:AddAnchor("CENTER", btn, 0, 0)
@@ -1279,6 +1440,8 @@ function BuffSettingsWindow.ToggleBuffSelectionWindow()
         local isVisible = buffSelectionWindow:IsVisible()
         buffSelectionWindow:Show(not isVisible)
         if not isVisible then
+            -- Thin-line geometry with the live scale; no-op when unchanged
+            RefreshPxGeometry()
             fillBuffData(buffScrollList, 1, searchEditBox:GetText())
             -- First time the window is opened, not at load: the card lands when
             -- the player is already looking at the addon.
@@ -1372,7 +1535,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     -- BetterBars-style flat dark shell: CreateEmptyWindow + color drawables
     -- (outline, body, header bar, accent stripe) instead of the default game
     -- window chrome. Drag and close are wired manually below.
-    local wndWidth, wndHeight = 500, 892
+    local wndWidth, wndHeight = 500, 948
     buffSelectionWindow = api.Interface:CreateEmptyWindow("buffSelectorWindow", "UIParent")
     buffSelectionWindow:SetExtent(wndWidth, wndHeight)
     buffSelectionWindow:AddAnchor("CENTER", "UIParent", "CENTER", 0, 0)
@@ -1384,6 +1547,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     local wndBody = buffSelectionWindow:CreateColorDrawable(0.06, 0.06, 0.068, 0.96, "background")
     wndBody:AddAnchor("TOPLEFT", buffSelectionWindow, 1, 1)
     wndBody:AddAnchor("BOTTOMRIGHT", buffSelectionWindow, -1, -1)
+    RegisterPxInset(wndBody, buffSelectionWindow)
 
     local wndHeader = buffSelectionWindow:CreateColorDrawable(0.09, 0.09, 0.11, 0.98, "background")
     wndHeader:SetExtent(wndWidth - 2, 34)
@@ -1392,6 +1556,14 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     local wndAccent = buffSelectionWindow:CreateColorDrawable(0, 0.75, 0.75, 0.85, "background")
     wndAccent:SetExtent(4, 34)
     wndAccent:AddAnchor("TOPLEFT", buffSelectionWindow, 1, 1)
+    RegisterPxRefresher(function()
+        local b = Px(1)
+        wndHeader:SetExtent(wndWidth - 2 * b, 34)
+        wndHeader:RemoveAllAnchors()
+        wndHeader:AddAnchor("TOPLEFT", buffSelectionWindow, b, b)
+        wndAccent:RemoveAllAnchors()
+        wndAccent:AddAnchor("TOPLEFT", buffSelectionWindow, b, b)
+    end)
 
     local wndTitle = buffSelectionWindow:CreateChildWidget("label", "ttpWndTitle", 0, true)
     wndTitle:SetExtent(220, 18)
@@ -1481,6 +1653,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         local fill = btn:CreateColorDrawable(TONE_IDLE[1], TONE_IDLE[2], TONE_IDLE[3], TONE_IDLE[4], "background")
         fill:AddAnchor("TOPLEFT", btn, 1, 1)
         fill:AddAnchor("BOTTOMRIGHT", btn, -1, -1)
+        RegisterPxInset(fill, btn)
         local lbl = btn:CreateChildWidget("label", id .. "_txt", 0, true)
         lbl:SetExtent(w - 4, 14)
         lbl:AddAnchor("CENTER", btn, 0, 0)
@@ -1521,6 +1694,12 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         local fill = btn:CreateColorDrawable(0.14, 0.14, 0.16, 1, "overlay")
         fill:SetExtent(12, 12)
         fill:AddAnchor("RIGHT", btn, -1, 0)
+        RegisterPxRefresher(function()
+            local b = Px(1)
+            fill:SetExtent(14 - 2 * b, 14 - 2 * b)
+            fill:RemoveAllAnchors()
+            fill:AddAnchor("RIGHT", btn, -b, 0)
+        end)
 
         local lbl = btn:CreateChildWidget("label", id .. "_lbl", 0, true)
         lbl:SetExtent(w - 22, 16)
@@ -1547,25 +1726,34 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         return btn, refresh
     end
 
-    local function createSliderRow(panel, y, labelText, minV, maxV, value, onChanged, displayFn)
+    -- layout (optional) overrides the row geometry for narrow parents; the
+    -- defaults are the 468-wide section-panel layout every DISPLAY/TIMERS row
+    -- uses. Keys: labelX/labelW, trackX/trackW, valX/valW.
+    local function createSliderRow(panel, y, labelText, minV, maxV, value, onChanged, displayFn, layout)
         sliderCount = sliderCount + 1
         local id = "ttpSlider" .. sliderCount
         displayFn = displayFn or tostring
+        layout = layout or {}
+        local labelX = layout.labelX or 14
+        local labelW = layout.labelW or 102
+        local trackX = layout.trackX or 148
+        local valX = layout.valX or 404
+        local valW = layout.valW or 52
 
-        local trackW, trackH = 202, 16
+        local trackW, trackH = layout.trackW or 202, 16
         local cur = math.max(minV, math.min(maxV, value))
 
         local lbl = panel:CreateChildWidget("label", id .. "_lbl", 0, true)
-        lbl:SetExtent(102, 16)
-        lbl:AddAnchor("TOPLEFT", panel, 14, y + 2)
+        lbl:SetExtent(labelW, 16)
+        lbl:AddAnchor("TOPLEFT", panel, labelX, y + 2)
         lbl:SetText(labelText)
         lbl.style:SetAlign(ALIGN.LEFT)
         lbl.style:SetFontSize(13)
         lbl.style:SetColor(1, 0.84, 0, 1)
 
         local valLbl = panel:CreateChildWidget("label", id .. "_val", 0, true)
-        valLbl:SetExtent(52, 16)
-        valLbl:AddAnchor("TOPLEFT", panel, 404, y + 2)
+        valLbl:SetExtent(valW, 16)
+        valLbl:AddAnchor("TOPLEFT", panel, valX, y + 2)
         valLbl:SetText(displayFn(cur))
         valLbl.style:SetAlign(ALIGN.CENTER)
         valLbl.style:SetFontSize(13)
@@ -1574,7 +1762,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         -- Track with proportional fill (button so it receives wheel input)
         local track = panel:CreateChildWidget("button", id .. "_track", 0, true)
         track:SetExtent(trackW, trackH)
-        track:AddAnchor("TOPLEFT", panel, 148, y)
+        track:AddAnchor("TOPLEFT", panel, trackX, y)
         track:SetText("")
         local trackBorder = track:CreateColorDrawable(0, 0, 0, 0.92, "background")
         trackBorder:AddAnchor("TOPLEFT", track, 0, 0)
@@ -1582,20 +1770,26 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         local trackBg = track:CreateColorDrawable(0.10, 0.10, 0.12, 0.95, "background")
         trackBg:AddAnchor("TOPLEFT", track, 1, 1)
         trackBg:AddAnchor("BOTTOMRIGHT", track, -1, -1)
+        RegisterPxInset(trackBg, track)
         local fill = track:CreateColorDrawable(0, 0.55, 0.55, 0.9, "background")
         fill:AddAnchor("TOPLEFT", track, 1, 1)
 
         local function refreshFill()
+            -- Live Px: the fill sits one device pixel inside the track
+            local b = Px(1)
             local frac = (cur - minV) / (maxV - minV)
-            local w = math.floor(frac * (trackW - 2) + 0.5)
+            local w = math.floor(frac * (trackW - 2 * b) + 0.5)
             if w < 1 then
                 fill:SetVisible(false)
             else
                 fill:SetVisible(true)
-                fill:SetExtent(w, trackH - 2)
+                fill:RemoveAllAnchors()
+                fill:AddAnchor("TOPLEFT", track, b, b)
+                fill:SetExtent(w, trackH - 2 * b)
             end
         end
         refreshFill()
+        RegisterPxRefresher(refreshFill)
 
         local function apply(nv)
             if nv < minV then nv = minV end
@@ -1611,6 +1805,25 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         track:SetHandler("OnWheelUp", function() apply(cur + 1) end)
         track:SetHandler("OnWheelDown", function() apply(cur - 1) end)
 
+        -- Click anywhere on the track to jump straight to that value. Both
+        -- readings are in DEVICE pixels - GetMousePos always is, and
+        -- GetEffectiveOffset is the post-scale screen position (the client's
+        -- own SaveBound/ApplyLastWindowOffset pair divides it by the UI scale
+        -- before re-anchoring, which is what certifies the space) - so the
+        -- fraction needs the track's device width: trackW is in UI units and
+        -- is multiplied up. The fraction is then scale-free.
+        track:SetHandler("OnClick", function()
+            pcall(function()
+                local mouseX = api.Input:GetMousePos()
+                local trackX = track:GetEffectiveOffset()
+                if type(mouseX) ~= "number" or type(trackX) ~= "number" then return end
+                local frac = (mouseX - trackX) / (trackW * uiScaleOrOne())
+                if frac < 0 then frac = 0 end
+                if frac > 1 then frac = 1 end
+                apply(minV + math.floor(frac * (maxV - minV) + 0.5))
+            end)
+        end)
+
         local function makeStepBtn(suffix, text, x, delta)
             local b = panel:CreateChildWidget("button", id .. suffix, 0, true)
             b:SetExtent(18, trackH)
@@ -1622,6 +1835,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             local bf = b:CreateColorDrawable(0.16, 0.16, 0.18, 0.95, "background")
             bf:AddAnchor("TOPLEFT", b, 1, 1)
             bf:AddAnchor("BOTTOMRIGHT", b, -1, -1)
+            RegisterPxInset(bf, b)
             local bl = b:CreateChildWidget("label", id .. suffix .. "_t", 0, true)
             bl:SetExtent(16, 14)
             bl:AddAnchor("CENTER", b, 0, 0)
@@ -1634,8 +1848,11 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             b:Show(true)
             return b
         end
-        makeStepBtn("_dec", "-", 124, -1)
-        makeStepBtn("_inc", "+", 354, 1)
+        -- Derived from the track so narrow layouts carry them along: dec sits
+        -- 24 ahead of the track (18 wide + the 6px gap the panel rows use),
+        -- inc 4 past its end. Identity with the old 124/354 at the defaults.
+        makeStepBtn("_dec", "-", trackX - 24, -1)
+        makeStepBtn("_inc", "+", trackX + trackW + 4, 1)
         track:Show(true)
     end
 
@@ -1660,20 +1877,26 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     credit:Clickable(false)
 
     --================= DISPLAY section =================--
-    local displayPanel = createSectionPanel("ttpDisplayPanel", 16, 42, 468, 172, "DISPLAY")
-    createSliderRow(displayPanel, 32, "Icon size", 25, 58, s.iconSize, function(v)
+    local displayPanel = createSectionPanel("ttpDisplayPanel", 16, 42, 468, 198, "DISPLAY")
+    -- Sizes the above-head player bar only; the static bar has its own slider
+    -- in its Configure popup
+    createSliderRow(displayPanel, 32, "Player icons", 25, 58, s.iconSize, function(v)
         BuffSettingsWindow.settings.iconSize = v
         queueSave()
     end)
-    createSliderRow(displayPanel, 58, "Icon spacing", 1, 10, s.iconSpacing, function(v)
+    createSliderRow(displayPanel, 58, "Target icons", 25, 58, s.targetIconSize, function(v)
+        BuffSettingsWindow.settings.targetIconSize = v
+        queueSave()
+    end)
+    createSliderRow(displayPanel, 84, "Icon spacing", 1, 10, s.iconSpacing, function(v)
         BuffSettingsWindow.settings.iconSpacing = v
         queueSave()
     end)
-    createSliderRow(displayPanel, 84, "Text size", 10, 36, s.fontSize, function(v)
+    createSliderRow(displayPanel, 110, "Text size", 10, 36, s.fontSize, function(v)
         BuffSettingsWindow.settings.fontSize = v
         queueSave()
     end)
-    createSliderRow(displayPanel, 110, "Max buffs", 3, BuffSettingsWindow.MAX_BUFFS_COUNT, s.maxBuffsShown, function(v)
+    createSliderRow(displayPanel, 136, "Max buffs", 3, BuffSettingsWindow.MAX_BUFFS_COUNT, s.maxBuffsShown, function(v)
         BuffSettingsWindow.settings.maxBuffsShown = v
         queueSave()
     end)
@@ -1681,7 +1904,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     -- Label starts on the sliders' left edge; the box is right-anchored, so the
     -- width lands it under their "-" step button (that sits at 124 and is 18
     -- wide, so its centre is 133; a 14px box ending at 140 centres on the same).
-    createFlatCheck(displayPanel, "ttpStacksCheck", "Show stacks", 14, 138, 126,
+    createFlatCheck(displayPanel, "ttpStacksCheck", "Show stacks", 14, 164, 126,
         function() return BuffSettingsWindow.settings.shouldShowStacks == true end,
         function()
             BuffSettingsWindow.settings.shouldShowStacks =
@@ -1690,7 +1913,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         end)
 
     --================= TIMERS & POSITION section =================--
-    local timersPanel = createSectionPanel("ttpTimersPanel", 16, 220, 468, 142, "TIMERS & POSITION")
+    local timersPanel = createSectionPanel("ttpTimersPanel", 16, 246, 468, 142, "TIMERS & POSITION")
     createSliderRow(timersPanel, 32, "Buff warn", 0, 10, math.floor(s.buffWarnTime / 1000), function(v)
         BuffSettingsWindow.settings.buffWarnTime = v * 1000
         queueSave()
@@ -1699,18 +1922,20 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         BuffSettingsWindow.settings.debuffWarnTime = v * 1000
         queueSave()
     end, function(v) return v .. "s" end)
-    -- Offsets are stored as -60..-20; the slider works in 0..40 and maps
-    createSliderRow(timersPanel, 84, "Player offset", 0, 40, s.playerBuffVerticalOffset + 60, function(v)
-        BuffSettingsWindow.settings.playerBuffVerticalOffset = v - 60
+    -- Offsets are stored as -100..100 (negative = above the head anchor); the
+    -- slider works in 0..200 and maps. 200 steps on a ~200px track is 1px per
+    -- step, so click-to-set can land on any value.
+    createSliderRow(timersPanel, 84, "Player offset", 0, 200, s.playerBuffVerticalOffset + 100, function(v)
+        BuffSettingsWindow.settings.playerBuffVerticalOffset = v - 100
         queueSave()
-    end, function(v) return tostring(v - 60) end)
-    createSliderRow(timersPanel, 110, "Target offset", 0, 40, s.targetBuffVerticalOffset + 60, function(v)
-        BuffSettingsWindow.settings.targetBuffVerticalOffset = v - 60
+    end, function(v) return tostring(v - 100) end)
+    createSliderRow(timersPanel, 110, "Target offset", 0, 200, s.targetBuffVerticalOffset + 100, function(v)
+        BuffSettingsWindow.settings.targetBuffVerticalOffset = v - 100
         queueSave()
-    end, function(v) return tostring(v - 60) end)
+    end, function(v) return tostring(v - 100) end)
 
     --================= PLAYER BAR section =================--
-    local playerBarPanel = createSectionPanel("ttpPlayerBarPanel", 16, 368, 468, 62, "PLAYER BAR")
+    local playerBarPanel = createSectionPanel("ttpPlayerBarPanel", 16, 394, 468, 92, "PLAYER BAR")
 
     -- Two modes. Nameplate compensation used to be a third one; it is the
     -- Nametag toggle beside this now, because it is orthogonal to where the bar
@@ -1802,14 +2027,172 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         "correct then.")
     slotRefresh()
 
+    --================= Static bar (second row of PLAYER BAR) =================--
+    -- A second, always-fixed player bar with its own watched list. The panel
+    -- carries a single button; everything about the bar - enabling it,
+    -- placing it, sizing it, jumping to its list - lives in the popup it
+    -- opens, so the panel stays two short rows.
+    --
+    -- Declared ahead of the widgets: the window's OnHide (defined at the end
+    -- of Initialize) must be able to end an active move.
+    local staticCfgPopup
+    local staticMoveActive = false
+    local staticMoveBtn
+
+    -- Emitting the unlock event TOGGLES main.lua's drag state, so this guards
+    -- on its own flag to only ever emit while a move is actually open
+    local function endStaticMove()
+        if not staticMoveActive then return end
+        staticMoveActive = false
+        if staticMoveBtn then
+            staticMoveBtn:SetFlatText("Move bar")
+            staticMoveBtn:SetTone(TONE_IDLE)
+        end
+        api:Emit("TTP_STATICBAR_UNLOCK")
+    end
+
+    -- The one panel-side control: opens the popup. Sits in the mode button's
+    -- column, matching its width, since it is now alone on the row.
+    local staticCfgBtn = createFlatButton(playerBarPanel, "ttpStaticCfgBtn", "Static Bar", 14, 62, 170, 22, function()
+        if not staticCfgPopup then return end
+        local wasVisible = staticCfgPopup:IsVisible()
+        staticCfgPopup:Show(not wasVisible)
+        if not wasVisible then
+            -- Created before the TRACKING panel and the buff list, so lift it
+            -- above them (same treatment as the dropdown popups)
+            pcall(function() staticCfgPopup:Raise() end)
+        end
+    end)
+    addTooltip("ttpStaticCfgTip", staticCfgBtn,
+        "A second bar for your own buffs, pinned to a fixed screen spot, \n" ..
+        "with its own list - independent of the bar above your head, so a \n" ..
+        "buff can be on either bar, or on both. \n" ..
+        "Opens its settings: enable it, place it, size it, edit its list. \n" ..
+        "Placing works with the bar disabled too.")
+
+    -- The popup. A child of the settings window on purpose: it follows window
+    -- drags, hides with it, and the /reload stale-HUD sweep that parks the
+    -- window off screen takes the popup along without knowing it exists.
+    staticCfgPopup = buffSelectionWindow:CreateChildWidget("emptywidget", "ttpStaticCfgPopup", 0, true)
+    local popW, popH = 300, 196
+    staticCfgPopup:SetExtent(popW, popH)
+    -- Flyout at the window's top-right, outside the frame: covers no settings,
+    -- and top-aligned with the header so it reads as part of the same window
+    staticCfgPopup:AddAnchor("TOPLEFT", buffSelectionWindow, "TOPRIGHT", 8, 0)
+
+    local popOutline = staticCfgPopup:CreateColorDrawable(0, 0, 0, 0.96, "background")
+    popOutline:AddAnchor("TOPLEFT", staticCfgPopup, 0, 0)
+    popOutline:AddAnchor("BOTTOMRIGHT", staticCfgPopup, 0, 0)
+    local popBody = staticCfgPopup:CreateColorDrawable(0.06, 0.06, 0.068, 0.98, "background")
+    popBody:AddAnchor("TOPLEFT", staticCfgPopup, 1, 1)
+    popBody:AddAnchor("BOTTOMRIGHT", staticCfgPopup, -1, -1)
+    RegisterPxInset(popBody, staticCfgPopup)
+    local popHeader = staticCfgPopup:CreateColorDrawable(0.09, 0.09, 0.11, 0.98, "background")
+    popHeader:SetExtent(popW - 2, 30)
+    popHeader:AddAnchor("TOPLEFT", staticCfgPopup, 1, 1)
+    -- Accent in the static track-type tint, tying the popup to the dropdown entry
+    local popAccent = staticCfgPopup:CreateColorDrawable(0.72, 0.58, 0.95, 0.85, "background")
+    popAccent:SetExtent(4, 30)
+    popAccent:AddAnchor("TOPLEFT", staticCfgPopup, 1, 1)
+    RegisterPxRefresher(function()
+        local b = Px(1)
+        popHeader:SetExtent(popW - 2 * b, 30)
+        popHeader:RemoveAllAnchors()
+        popHeader:AddAnchor("TOPLEFT", staticCfgPopup, b, b)
+        popAccent:RemoveAllAnchors()
+        popAccent:AddAnchor("TOPLEFT", staticCfgPopup, b, b)
+    end)
+
+    local popTitle = staticCfgPopup:CreateChildWidget("label", "ttpStaticCfgTitle", 0, true)
+    popTitle:SetExtent(200, 16)
+    popTitle:AddAnchor("TOPLEFT", staticCfgPopup, 14, 8)
+    -- Matches the panel button's label exactly, so the popup reads as that
+    -- button's window
+    popTitle:SetText("Static Bar")
+    popTitle.style:SetFontSize(15)
+    popTitle.style:SetAlign(ALIGN.LEFT)
+    popTitle.style:SetColor(1, 0.84, 0, 1)
+    popTitle:Clickable(false)
+
+    createFlatButton(staticCfgPopup, "ttpStaticCfgClose", "X", popW - 30, 4, 24, 22, function()
+        staticCfgPopup:Show(false)
+    end)
+
+    -- The enable toggle, moved here from a PLAYER BAR checkbox: full-width
+    -- state button, first row, since it is the bar's primary switch
+    local staticEnableBtn
+    local function staticEnableRefresh()
+        local on = BuffSettingsWindow.settings.staticBarEnabled == true
+        staticEnableBtn:SetFlatText(on and "Enabled" or "Disabled")
+        staticEnableBtn:SetTone(on and TONE_ACTIVE or TONE_IDLE)
+    end
+    staticEnableBtn = createFlatButton(staticCfgPopup, "ttpStaticEnableBtn", "", 14, 40, popW - 28, 22, function()
+        local enabled = not (BuffSettingsWindow.settings.staticBarEnabled == true)
+        BuffSettingsWindow.settings.staticBarEnabled = enabled
+        -- Turning the bar off with a drag open would strand it unlocked
+        if not enabled then endStaticMove() end
+        staticEnableRefresh()
+        BuffSettingsWindow.SaveSettings()
+    end)
+    staticEnableRefresh()
+    addTooltip("ttpStaticEnableTip", staticEnableBtn,
+        "Turns the static bar on or off. \n" ..
+        "Placing and sizing below work with the bar disabled too, \n" ..
+        "so it can be set up first and enabled when wanted.")
+
+    staticMoveBtn = createFlatButton(staticCfgPopup, "ttpStaticMoveBtn", "Move bar", 14, 70, 130, 22, function()
+        staticMoveActive = not staticMoveActive
+        staticMoveBtn:SetFlatText(staticMoveActive and "Done moving" or "Move bar")
+        staticMoveBtn:SetTone(staticMoveActive and TONE_ACTIVE or TONE_IDLE)
+        api:Emit("TTP_STATICBAR_UNLOCK")
+    end)
+    addTooltip("ttpStaticMoveTip", staticMoveBtn,
+        "Shows the static bar as a colored box you can drag anywhere. \n" ..
+        "Click again to lock the position.")
+
+    createFlatButton(staticCfgPopup, "ttpStaticEditBtn", "Edit list", 156, 70, 130, 22, function()
+        if trackTypeDropdown and trackTypeDropdown.SelectAndApply then
+            trackTypeDropdown:SelectAndApply(TRACK_TYPE_STATIC)
+        end
+    end)
+
+    -- The bar's own icon size, on the compact layout: the standard row is laid
+    -- for the 468-wide panels and would run 156 units past this popup's edge.
+    -- Every x here is derived left-to-right inside popW = 300, with the step
+    -- buttons following the track automatically (see makeStepBtn).
+    createSliderRow(staticCfgPopup, 104, "Icon size", 25, 58, s.staticIconSize, function(v)
+        BuffSettingsWindow.settings.staticIconSize = v
+        queueSave()
+    end, nil, { labelW = 62, trackX = 104, trackW = 118, valX = 248, valW = 40 })
+
+    -- Short primer, info-card style: fixed lines rather than wordwrap so the
+    -- text cannot reflow against the fixed popup extent
+    local staticHintLines = {
+        "The bar only appears while Enabled AND its list",
+        "has buffs. The list lives under TRACKING: set",
+        "Track type to 'Static bar', then tick buffs.",
+    }
+    for i, lineText in ipairs(staticHintLines) do
+        local hint = staticCfgPopup:CreateChildWidget("label", "ttpStaticHint" .. i, 0, true)
+        hint:SetExtent(popW - 28, 14)
+        hint:AddAnchor("TOPLEFT", staticCfgPopup, 14, 132 + (i - 1) * 17)
+        hint:SetText(lineText)
+        hint.style:SetFontSize(12)
+        hint.style:SetAlign(ALIGN.LEFT)
+        hint.style:SetColor(0.55, 0.57, 0.62, 1)
+        hint:Clickable(false)
+    end
+
+    staticCfgPopup:Show(false)
+
     --================= TRACKING section =================--
-    local trackingPanel = createSectionPanel("ttpTrackingPanel", 16, 436, 468, 140, "TRACKING")
+    local trackingPanel = createSectionPanel("ttpTrackingPanel", 16, 492, 468, 140, "TRACKING")
 
     -- The two dropdowns build their own label and anchor themselves; only the
     -- search box and the scroll list still come from the shared helpers.
     local anchors = {
         searchEditBox = createAnchor(trackingPanel, 310, 32),
-        buffScrollList = createAnchor(buffSelectionWindow, 40, 586),
+        buffScrollList = createAnchor(buffSelectionWindow, 40, 642),
     }
 
     --================= Watched-list scope / sharing row =================--
@@ -1953,6 +2336,8 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     local TINT_PLAYER = {0.45, 0.85, 0.50, 1}
     local TINT_TARGET = {0.95, 0.45, 0.45, 1}
     local TINT_BOTH = {0.95, 0.80, 0.45, 1}
+    -- Static bar: violet, read against the green/red/amber of the other three
+    local TINT_STATIC = {0.72, 0.58, 0.95, 1}
     local TINT_ALL = {0.62, 0.66, 0.72, 1}
     local TINT_LOGGED = {0.95, 0.70, 0.35, 1}
     local TINT_WATCHED = {0.35, 0.80, 0.80, 1} -- matches the cyan panel accent
@@ -1999,6 +2384,15 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             row:AddAnchor("RIGHT", parent, -rightInset - (9 - w) / 2, -2 + i)
             table.insert(rows, row)
         end
+        -- Glyph-internal geometry in device pixels; rightInset stays layout
+        RegisterPxRefresher(function()
+            for i, w in ipairs(widths) do
+                local row = rows[i]
+                row:SetExtent(Px(w), Px(1))
+                row:RemoveAllAnchors()
+                row:AddAnchor("RIGHT", parent, -rightInset - Px((9 - w) / 2), Px(-2 + i))
+            end
+        end)
         return rows
     end
 
@@ -2014,6 +2408,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         local fill = dd:CreateColorDrawable(0.10, 0.10, 0.12, 1, "background")
         fill:AddAnchor("TOPLEFT", dd, 1, 1)
         fill:AddAnchor("BOTTOMRIGHT", dd, -1, -1)
+        RegisterPxInset(fill, dd)
 
         local text = dd:CreateChildWidget("label", id .. "_txt", 0, true)
         text:SetExtent(w - 28, 14)
@@ -2036,7 +2431,9 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         local popFill = popup:CreateColorDrawable(0.08, 0.08, 0.095, 1, "background")
         popFill:AddAnchor("TOPLEFT", popup, 1, 1)
         popFill:AddAnchor("BOTTOMRIGHT", popup, -1, -1)
+        RegisterPxInset(popFill, popup)
         popup:Show(false)
+        local optionRows = {}
 
         dd.dropdownItem = options
         dd._index = defaultIndex or 1
@@ -2055,6 +2452,14 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             if index < 1 or index > #options then index = 1 end
             self._index = index
             text:SetText(options[index] or "")
+        end
+
+        -- Select AND run the selection callback, as if the row were clicked.
+        -- For callers outside the dropdown (the static-bar popup's Edit list
+        -- shortcut) - plain Select only repaints the collapsed text.
+        function dd:SelectAndApply(index)
+            self:Select(index)
+            if onSelect then onSelect(self._index, options[self._index]) end
         end
 
         function dd:SetAllTextColor(color)
@@ -2089,7 +2494,19 @@ function BuffSettingsWindow.Initialize(buffsLogger)
                 if onSelect then onSelect(i, options[i]) end
             end)
             row:Show(true)
+            table.insert(optionRows, row)
         end
+        -- Rows sit inside the popup's one-device-pixel ring; the popup's own
+        -- height carries the ring twice
+        RegisterPxRefresher(function()
+            local b = Px(1)
+            popup:SetExtent(w, #options * rowHeight + 2 * b)
+            for i, row in ipairs(optionRows) do
+                row:SetExtent(w - 2 * b, rowHeight)
+                row:RemoveAllAnchors()
+                row:AddAnchor("TOPLEFT", popup, b, b + (i - 1) * rowHeight)
+            end
+        end)
 
         dd:SetHandler("OnClick", function()
             if popup:IsVisible() then
@@ -2123,6 +2540,8 @@ function BuffSettingsWindow.Initialize(buffsLogger)
                 trackTypeDropdown:SetAllTextColor(TINT_PLAYER)
             elseif selectedIndex == TRACK_TYPE_TARGET then -- Target
                 trackTypeDropdown:SetAllTextColor(TINT_TARGET)
+            elseif selectedIndex == TRACK_TYPE_STATIC then -- Static bar
+                trackTypeDropdown:SetAllTextColor(TINT_STATIC)
             else -- Both
                 trackTypeDropdown:SetAllTextColor(TINT_BOTH)
             end
@@ -2133,7 +2552,9 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         "Which list the checkmarks below apply to. \n" ..
         "'Both' keeps the Player and Target lists separate but applies every \n" ..
         "click to each of them, and only shows a checkmark when a buff is on \n" ..
-        "both. Clicking a buff watched on just one adds it to the other.")
+        "both. Clicking a buff watched on just one adds it to the other. \n" ..
+        "'Static bar' is the second player bar's own list (see PLAYER BAR), \n" ..
+        "independent of the other two.")
 
     -- (show-stacks toggle now lives in the PLAYER BAR panel above)
     
@@ -2228,6 +2649,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         local fill = searchEditBox:CreateColorDrawable(0.10, 0.10, 0.12, 1, "background")
         fill:AddAnchor("TOPLEFT", searchEditBox, 1, 1)
         fill:AddAnchor("BOTTOMRIGHT", searchEditBox, -1, -1)
+        RegisterPxInset(fill, searchEditBox)
     end)
 
     --================= Create select all button (flat) =================--
@@ -2306,6 +2728,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             local fill = widget:CreateColorDrawable(r, g, b, a, layer)
             fill:AddAnchor("TOPLEFT", widget, 1, 1)
             fill:AddAnchor("BOTTOMRIGHT", widget, -1, -1)
+            RegisterPxInset(fill, widget)
         end)
     end
 
@@ -2319,12 +2742,22 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     local function drawTriangle(parent, dir, r, g, b)
         -- Kept narrow enough to still fit once the scrollbar is slimmed down
         local widths = { 7, 5, 3, 1 }
+        local rows = {}
         for i, width in ipairs(widths) do
             local step = (dir == "up") and (#widths - i + 1) or i
             local row = parent:CreateColorDrawable(r, g, b, 1, "overlay")
             row:SetExtent(width, 1)
             row:AddAnchor("CENTER", parent, 0, -3 + step)
+            rows[i] = { row = row, step = step, width = width }
         end
+        -- Rows are device pixels or the glyph loses rows at sub-100% scale
+        RegisterPxRefresher(function()
+            for _, e in ipairs(rows) do
+                e.row:SetExtent(Px(e.width), Px(1))
+                e.row:RemoveAllAnchors()
+                e.row:AddAnchor("CENTER", parent, 0, Px(-3 + e.step))
+            end
+        end)
     end
 
     if scrollWidget then
@@ -2378,6 +2811,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
             local fill = scrollWidget:CreateColorDrawable(0.10, 0.10, 0.12, 1, "background")
             fill:AddAnchor("TOPLEFT", scrollWidget, 1, 1)
             fill:AddAnchor("BOTTOMRIGHT", scrollWidget, TRACK_RIGHT_EXTEND - 1, -1)
+            RegisterPxInset(fill, scrollWidget, TRACK_RIGHT_EXTEND)
         end)
         if thumb then
             -- Edge to edge rather than paintFlat's border+inset fill: the 1px inset
@@ -2399,6 +2833,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
                 local fill = arrow:CreateColorDrawable(0.14, 0.14, 0.16, 1, "overlay")
                 fill:AddAnchor("TOPLEFT", arrow, 1, 1)
                 fill:AddAnchor("BOTTOMRIGHT", arrow, TRACK_RIGHT_EXTEND - 1, -1)
+                RegisterPxInset(fill, arrow, TRACK_RIGHT_EXTEND)
             end)
             pcall(function() drawTriangle(arrow, dir, 0.62, 0.66, 0.72) end)
         end
@@ -2529,6 +2964,10 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         -- A dropdown popup is parented to the window but shown independently, so
         -- close it explicitly rather than leaving it floating
         if openDropdown then openDropdown:HidePopup() end
+        -- Same for the static-bar popup, and an open Move drag would otherwise
+        -- strand the bar unlocked with its toggle button hidden
+        endStaticMove()
+        if staticCfgPopup then staticCfgPopup:Show(false) end
         buffScrollList:DeleteAllDatas()
         BuffSettingsWindow.SaveSettings()
     end

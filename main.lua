@@ -26,11 +26,61 @@ local function GetUIScaleSafe()
     if type(scale) ~= "number" or scale <= 0 then return 1 end
     return scale
 end
+-- Screen size in the space the PROJECTION functions speak. Divided by the
+-- scale, exactly as shipped 3.1 - this is the field-verified UI-scale graft
+-- and it is only ever compared against GetUnitScreenPosition output.
+--
+-- Do NOT "correct" this from the fixed-bar measurement. Those are two
+-- different spaces and conflating them cost a regression: raising the
+-- nametag X pin from (1920/1.1)/2 = 873 to 1920/2 = 960 pushed the
+-- above-head bar off to the RIGHT. 3.1's value is right for this path.
+-- The measured device space (see the drag handlers) governs the SAVED
+-- fixed-bar offsets and nothing else here.
 local function ScreenUIWidth()
     return api.Interface:GetScreenWidth() / GetUIScaleSafe()
 end
 local function ScreenUIHeight()
     return api.Interface:GetScreenHeight() / GetUIScaleSafe()
+end
+
+-- Keeps a saved fixed-bar position reachable.
+--
+-- PINNED-BAR POSITIONING = DAWNSDROP'S, exactly (Addon/dawnsdrop - a
+-- shipping addon whose window holds position across reloads and scales):
+--   * one positioning function: bare TOPLEFT AddAnchor, raw values
+--     (SetPinnedPosition below = its SetWndPosition);
+--   * drag with anchors ON, save GetOffset raw+floored at DragStop, then
+--     IMMEDIATELY re-apply the saved values - screen state == saved state
+--     from the moment the mouse releases;
+--   * the session's FIRST anchor happens on the first UPDATE tick, never
+--     during load. Dawnsdrop's source says why, verbatim: "for some reason
+--     if UI Scaling is in effect we cannot set the Anchor in Load()". That
+--     engine quirk is the misplaced-until-poked behaviour we chased for a
+--     day ("clicking Move bar snaps it back").
+--   * NO scale arithmetic anywhere in the position path, in either
+--     direction. Px()/UI_SCALING.md govern extents and thicknesses only.
+--
+-- HARD-LEARNED: never build a coordinate model from reading offsets back
+-- after AddAnchor - GetOffset/GetEffectiveOffset flip between pre- and
+-- post-layout values with timing (one dump caught eff echoing 508 AND 660.4
+-- for the same anchored 508). Three rework rounds came from trusting those
+-- echoes. The reads are only trustworthy immediately after
+-- StopMovingOrSizing, which is the one moment dawnsdrop reads them.
+--
+-- The margins keep a grabbable corner of the bar on screen; the clamp is
+-- TTP's one addition to the dawnsdrop pattern (dawnsdrop only floors), so a
+-- stale save can never strand a bar off screen. Raw device dims: readable
+-- at load, no scale term.
+local FIXED_BAR_MARGIN_X = 160
+local FIXED_BAR_MARGIN_Y = 40
+local function ClampToScreen(x, y)
+    x = tonumber(x) or 0
+    y = tonumber(y) or 0
+    local maxX = math.max(0, api.Interface:GetScreenWidth() - FIXED_BAR_MARGIN_X)
+    local maxY = math.max(0, api.Interface:GetScreenHeight() - FIXED_BAR_MARGIN_Y)
+    if x < 0 then x = 0 elseif x > maxX then x = maxX end
+    if y < 0 then y = 0 elseif y > maxY then y = maxY end
+    return math.floor(x + 0.5), math.floor(y + 0.5)
 end
 
 -- Fix a size in DEVICE pixels (the client's CalcDontApplyUIScale arithmetic,
@@ -66,12 +116,18 @@ local TargetBuffTrackerAddon = {
 -- UI Elements
 local playerBuffCanvas
 local targetBuffCanvas
+-- The static bar: a second player bar that only ever uses the fixed-screen
+-- anchoring, so none of the projection/nametag machinery below applies to it
+local staticBuffCanvas
 local playerBuffIcons = {}
 local playerBuffLabels = {}
 local targetBuffIcons = {}
 local targetBuffLabels = {}
 local playerBuffStackLabels = {}
 local targetBuffStackLabels = {}
+local staticBuffIcons = {}
+local staticBuffLabels = {}
+local staticBuffStackLabels = {}
 
 -- Variables
 local previousPlayerXYZString = "0,0,0"
@@ -81,8 +137,25 @@ local previousTargetXYZSmothed = {x = 0, y = 0, z = 0}
 local staleHideHandler
 local lastPlayerBuffSig = ""
 local lastTargetBuffSig = ""
+local lastStaticBuffSig = ""
 local playerBarUnlocked = false
-local lastFixedAnchorSig = ""
+local staticBarUnlocked = false
+-- Pinned-bar settle gate. Anchors laid while the client is still loading
+-- resolve wrong under UI scaling, so the pinned bars re-anchor per frame -
+-- but ONLY until the world has been LIVE for PIN_SETTLE_MS. Every
+-- wall-clock timer failed at this (the loading screen's own UPDATE ticks
+-- advance them), so this clock advances only on frames where the player
+-- projection returns finite values, i.e. the world is demonstrably
+-- rendering. Once it fills, the last anchor was laid on a settled tree and
+-- anchoring drops to on-change only: the post-settle steady state is two
+-- number compares per bar per frame, no anchor calls, no allocations.
+local PIN_SETTLE_MS = 5000
+local pinSettleMs = 0
+local pinSettled = false
+-- Last-applied anchor per pinned bar; numbers, so the per-frame check
+-- allocates nothing
+local lastStaticAppliedX, lastStaticAppliedY
+local lastFixedAppliedX, lastFixedAppliedY
 -- Nametag-compensated height follows the head, but only re-samples it when the CAMERA
 -- moves - which is what separates the two kinds of vertical movement:
 --
@@ -260,62 +333,58 @@ local function IsWatchedBuff(buffId, isPlayer)
     end
 end
 
+-- Same normalization for the static bar's own list
+local function IsStaticWatchedBuff(buffId)
+    buffId = math.floor(tonumber(buffId) or 0)
+    return BuffSettingsWindow.IsStaticBuffWatched(buffId)
+end
+
 -- Function to create buff icon and label
 local function CreateBuffElement(index, canvas)
     local icon = CreateItemIconButton("buffIcon" .. index, canvas)
-    F_SLOT.ApplySlotSkin(icon, icon.back, SLOT_STYLE.DEFAULT)
     icon:Clickable(false)
     icon:SetExtent(Px(BuffSettingsWindow.settings.iconSize), Px(BuffSettingsWindow.settings.iconSize))
     icon:Show(false)
 
-    -- Create a border around the icon.
-    -- Each border uses a SINGLE anchor point + a fixed extent. With two anchors
-    -- (old approach) the drawable stretches between them, and because the buff
-    -- canvas is re-anchored every frame the two points can momentarily resolve
-    -- to different screen positions - producing giant bars across the screen.
-    local topBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    icon.topBorder = topBorder
-    local bottomBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    icon.bottomBorder = bottomBorder
-    local leftBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    icon.leftBorder = leftBorder
-    local rightBorder = icon:CreateColorDrawable(1, 1, 1, 0, "overlay")
-    icon.rightBorder = rightBorder
+    -- Skinless icon with ONE owned border (BetterBars discipline; dawnsdrop's
+    -- icons prove CreateItemIconButton needs no slot skin). The engine skin
+    -- is a texture, so its frame scales with the UI and can never be held at
+    -- one device pixel - it is gone entirely, and the four edges below are
+    -- the single border: laid ON the icon's edge, one device pixel at every
+    -- scale, green for buffs / red for debuffs (ApplyBuffSkins colours them,
+    -- same palette as the settings list's category edges). Full alpha, so
+    -- the corner overlap between edges composites invisibly.
+    icon.edges = {
+        icon:CreateColorDrawable(1, 1, 1, 0, "overlay"),
+        icon:CreateColorDrawable(1, 1, 1, 0, "overlay"),
+        icon:CreateColorDrawable(1, 1, 1, 0, "overlay"),
+        icon:CreateColorDrawable(1, 1, 1, 0, "overlay"),
+    }
 
-    -- Size AND anchor the borders to the icon; re-run whenever the icon extent
-    -- changes. The border is one DEVICE pixel (Px), not one UI unit: at 85%
-    -- scale a 1-unit line is 0.85 device pixels and rasterises to nothing
-    -- along part of its length. Anchoring lives here too (still one anchor
-    -- per drawable), because the inset must match the live border thickness.
-    --
-    -- Corner-free layout: top and bottom span the full outline width
-    -- (w + 2b); left and right fill only the icon's own height between them.
-    -- The old h + 2b verticals overlapped the horizontals in all four corner
-    -- squares, and at 0.6 alpha a double-drawn corner composites to 0.84 -
-    -- every icon wore four darker dots.
-    function icon:UpdateBorderSize()
-        local b = Px(1)
+    -- Re-run whenever the icon extent changes (PositionBuffs) - the
+    -- thickness is live Px(1), and creation runs while the scale reads 1
+    function icon:UpdateEdges()
+        local t = Px(1)
         local w, h = self:GetWidth(), self:GetHeight()
-        self.topBorder:RemoveAllAnchors()
-        self.topBorder:AddAnchor("BOTTOMLEFT", self, "TOPLEFT", -b, 0)
-        self.bottomBorder:RemoveAllAnchors()
-        self.bottomBorder:AddAnchor("TOPLEFT", self, "BOTTOMLEFT", -b, 0)
-        self.leftBorder:RemoveAllAnchors()
-        self.leftBorder:AddAnchor("TOPRIGHT", self, "TOPLEFT", 0, 0)
-        self.rightBorder:RemoveAllAnchors()
-        self.rightBorder:AddAnchor("TOPLEFT", self, "TOPRIGHT", 0, 0)
-        self.topBorder:SetExtent(w + b * 2, b)
-        self.bottomBorder:SetExtent(w + b * 2, b)
-        self.leftBorder:SetExtent(b, h)
-        self.rightBorder:SetExtent(b, h)
+        local points = {
+            { "TOPLEFT", w, t },
+            { "BOTTOMLEFT", w, t },
+            { "TOPLEFT", t, h },
+            { "TOPRIGHT", t, h },
+        }
+        for i, spec in ipairs(points) do
+            local d = self.edges[i]
+            d:SetExtent(spec[2], spec[3])
+            d:RemoveAllAnchors()
+            d:AddAnchor(spec[1], self, spec[1], 0, 0)
+        end
     end
-    icon:UpdateBorderSize()
+    icon:UpdateEdges()
 
-    function icon:SetBorderColor(color)
-        self.topBorder:SetColor(unpack(color))
-        self.bottomBorder:SetColor(unpack(color))
-        self.leftBorder:SetColor(unpack(color))
-        self.rightBorder:SetColor(unpack(color))
+    function icon:SetEdgeColor(r, g, b, a)
+        for _, d in ipairs(self.edges) do
+            d:SetColor(r, g, b, a)
+        end
     end
 
     ----------------------------------------------------------------
@@ -353,22 +422,48 @@ local function CreateBuffElement(index, canvas)
 end
 
 -- Function to position buffs with whole bar centered
-local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels)
+-- iconSizeSetting is per bar since the player/target size split: the caller
+-- passes settings.iconSize (player), settings.targetIconSize (target) or
+-- settings.staticIconSize (static bar)
+local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels, iconSizeSetting, constantFootprint)
     local maxBuffsToDisplay = math.min(#watchedBuffs, BuffSettingsWindow.settings.maxBuffsShown)
     -- Device pixels (Px): the sliders' numbers mean on-screen pixels at every
     -- UI scale. Layout is otherwise exactly 3.0 (CENTER-anchored icons).
-    local iconSize = Px(BuffSettingsWindow.settings.iconSize)
+    local iconSize = Px(iconSizeSetting)
     local iconSpacing = Px(BuffSettingsWindow.settings.iconSpacing)
     local fontSize = Px(BuffSettingsWindow.settings.fontSize)
     local stackFontSize = Px(BuffSettingsWindow.settings.fontSize - 3)
 
-    local newWidth = iconSize * maxBuffsToDisplay + (maxBuffsToDisplay - 1) * iconSpacing
+    -- Icons stay CENTRE-anchored (shipped 3.0/3.1 layout, untouched). The one
+    -- change is the canvas FOOTPRINT for bars pinned to a screen point.
+    --
+    -- Measured, from ttp_posdump.txt: the saved position round-trips exactly
+    -- (stored 1331,745 -> eff 1331,745) and the bar STILL moved, because the
+    -- canvas resizes with the buff count - 213.636 wide with four icons,
+    -- 159.091 with three. A canvas anchored TOPLEFT that narrows by 54.5
+    -- slides its centre, and every icon with it, 27px left. That is the
+    -- "keeps shifting": a layout effect no saved coordinate could ever fix.
+    --
+    -- Sizing for maxBuffsShown regardless of how many buffs are up makes the
+    -- extent constant, so nothing moves when a buff lands or drops. This is
+    -- deliberately the ONLY change: the icons are not re-anchored (doing that
+    -- relocated the bars last time) and there is no arithmetic assuming
+    -- extents and anchor offsets share a space - a constant cannot be in the
+    -- wrong space. The head bar keeps content-sized extents: it re-anchors
+    -- every frame about a BOTTOM-centre anchor, where resizes are symmetric.
+    local slots = maxBuffsToDisplay
+    if constantFootprint then
+        slots = math.max(maxBuffsToDisplay, BuffSettingsWindow.settings.maxBuffsShown)
+    end
+    local newWidth = iconSize * slots + (slots - 1) * iconSpacing
     local newHeight = iconSize
 
     -- Update the canvas size
     canvas:SetExtent(newWidth, newHeight)
 
-    local startX = -newWidth / 2 + iconSize / 2
+    -- Icons centre on the canvas centre, exactly as before
+    local shownWidth = iconSize * maxBuffsToDisplay + (maxBuffsToDisplay - 1) * iconSpacing
+    local startX = -shownWidth / 2 + iconSize / 2
 
     for i = 1, maxBuffsToDisplay do
         local icon = icons[i]
@@ -383,26 +478,67 @@ local function PositionBuffs(watchedBuffs, canvas, icons, labels, stackLabels)
         stackLabel:RemoveAllAnchors()
         stackLabel:AddAnchor("TOPLEFT", icon, "TOPLEFT", Px(2), Px(6))
         icon:SetExtent(iconSize, iconSize)
-        icon:UpdateBorderSize()
+        icon:UpdateEdges()
         icon:RemoveAllAnchors()
         icon:AddAnchor("CENTER", canvas, "CENTER", offsetX, 0)
     end
+end
+
+-- Dawnsdrop's SetWndPosition, verbatim (dawnsdrop_view.lua:8-11): the ONE
+-- way a pinned canvas is ever positioned. Bare TOPLEFT anchor, raw values,
+-- no scale arithmetic, dawnsdrop's own 4-arg AddAnchor form. Every pinned
+-- anchor call in this file goes through here.
+local function SetPinnedPosition(canvas, x, y)
+    canvas:RemoveAllAnchors()
+    canvas:AddAnchor("TOPLEFT", "UIParent", x, y)
+end
+
+-- Make a fixed bar's canvas safe to drag: extent to the real footprint
+-- (live Px - the creation-time extent was computed while the scale still
+-- read 1), then the pinned anchor from the stored position. Guarantees
+-- StartMoving updates a TOPLEFT-to-UIParent anchor, whatever state the bar
+-- was in - the canvases are born anchorless, and the player bar coming out
+-- of head mode still carries head mode's BOTTOM anchor (saving THAT
+-- anchor's offset as a TOPLEFT position was the bottom-right jump at
+-- "Done moving"). Dawnsdrop never needs this because its canvas is anchored
+-- from creation and never re-anchored by another mode; this is the same
+-- always-anchored guarantee, arrived at on unlock.
+local function PrepareFixedBarDrag(canvas, storedPos, iconSizeSetting)
+    if not canvas then return end
+    local s = BuffSettingsWindow.settings
+    local iconSize = Px(iconSizeSetting)
+    local spacing = Px(s.iconSpacing)
+    local slots = math.max(1, s.maxBuffsShown)
+    canvas:SetExtent(iconSize * slots + (slots - 1) * spacing, iconSize)
+    local pos = storedPos or { 0, 0 }
+    local ax, ay = ClampToScreen(pos[1], pos[2])
+    SetPinnedPosition(canvas, ax, ay)
 end
 
 -- Function to collect all watched buffs and debuffs
 local function CollectWatchedBuffsAndDebuffs()
     local playerBuffs = {}
     local targetBuffs = {}
+    local staticBuffs = {}
 
-    -- Helper function to collect buffs and debuffs from a unit
-    local function CollectBuffsAndDebuffs(unit, buffList, isPlayer)
+    -- Helper function to collect buffs and debuffs from a unit. staticList
+    -- rides the player pass so the engine's buff array is only walked once:
+    -- the same buff table can land in both lists (both writers set the same
+    -- isBuff value, so sharing the table is safe).
+    local function CollectBuffsAndDebuffs(unit, buffList, isPlayer, staticList)
         -- Check buffs
         local buffCount = api.Unit:UnitBuffCount(unit) or 0
         for i = 1, buffCount do
             local buff = api.Unit:UnitBuff(unit, i)
-            if buff and IsWatchedBuff(buff.buff_id, isPlayer) then
-                buff.isBuff = true
-                table.insert(buffList, buff)
+            if buff then
+                if IsWatchedBuff(buff.buff_id, isPlayer) then
+                    buff.isBuff = true
+                    table.insert(buffList, buff)
+                end
+                if staticList and IsStaticWatchedBuff(buff.buff_id) then
+                    buff.isBuff = true
+                    table.insert(staticList, buff)
+                end
             end
         end
 
@@ -410,9 +546,15 @@ local function CollectWatchedBuffsAndDebuffs()
         local debuffCount = api.Unit:UnitDeBuffCount(unit) or 0
         for i = 1, debuffCount do
             local debuff = api.Unit:UnitDeBuff(unit, i)
-            if debuff and IsWatchedBuff(debuff.buff_id, isPlayer) then
-                debuff.isBuff = false
-                table.insert(buffList, debuff)
+            if debuff then
+                if IsWatchedBuff(debuff.buff_id, isPlayer) then
+                    debuff.isBuff = false
+                    table.insert(buffList, debuff)
+                end
+                if staticList and IsStaticWatchedBuff(debuff.buff_id) then
+                    debuff.isBuff = false
+                    table.insert(staticList, debuff)
+                end
             end
         end
     end
@@ -431,16 +573,20 @@ local function CollectWatchedBuffsAndDebuffs()
         return (a.buff_id or 0) < (b.buff_id or 0)
     end
 
-    -- Collect buffs and debuffs from the player
-    CollectBuffsAndDebuffs("player", playerBuffs, true)
+    -- Collect buffs and debuffs from the player. The static list is only
+    -- filled while its bar is enabled, so a disabled bar costs nothing here.
+    local staticEnabled = BuffSettingsWindow.settings.staticBarEnabled == true
+    CollectBuffsAndDebuffs("player", playerBuffs, true,
+        staticEnabled and staticBuffs or nil)
 
     -- Collect buffs and debuffs from the target
     CollectBuffsAndDebuffs("target", targetBuffs, false)
 
     table.sort(playerBuffs, stableOrder)
     table.sort(targetBuffs, stableOrder)
+    table.sort(staticBuffs, stableOrder)
 
-    return playerBuffs, targetBuffs
+    return playerBuffs, targetBuffs, staticBuffs
 end
 
 -- Function to clear all buff icons and labels
@@ -464,11 +610,22 @@ local function ClearAllBuffs()
         if targetBuffStackLabels[i] then
             targetBuffStackLabels[i]:Show(false)
         end
+        if staticBuffIcons[i] then
+            staticBuffIcons[i]:Show(false)
+        end
+        if staticBuffLabels[i] then
+            staticBuffLabels[i]:Show(false)
+        end
+        if staticBuffStackLabels[i] then
+            staticBuffStackLabels[i]:Show(false)
+        end
     end
 end
 
--- Icon texture/skin/border only change when the displayed buff list changes,
--- so they are applied on demand (see BuildBuffSignature) instead of every frame
+-- Icon texture/edge colour only change when the displayed buff list
+-- changes, so they are applied on demand (see BuildBuffSignature) instead
+-- of every frame. The icon's single border is the owned Px(1) edge ring
+-- (see CreateBuffElement); no slot skin is applied at all.
 local function ApplyBuffSkins(buffs, icons, maxBuffsToDisplay)
     for i = 1, maxBuffsToDisplay do
         local buff = buffs[i]
@@ -476,12 +633,11 @@ local function ApplyBuffSkins(buffs, icons, maxBuffsToDisplay)
 
         F_SLOT.SetIconBackGround(icon, buff.path)
 
+        -- Same palette as the settings list's category edges
         if buff.isBuff then
-            F_SLOT.ApplySlotSkin(icon, icon.back, BUFF)
-            icon:SetBorderColor({0, 1, 0, 0.6})
+            icon:SetEdgeColor(0.15, 0.85, 0.30, 0.95)
         else
-            F_SLOT.ApplySlotSkin(icon, icon.back, DEBUFF)
-            icon:SetBorderColor({1, 0, 0, 0.6})
+            icon:SetEdgeColor(0.90, 0.22, 0.22, 0.95)
         end
 
         icon:Show(true)
@@ -491,9 +647,10 @@ end
 -- Signature of what is currently displayed; anchor/skin work reruns only when it changes.
 -- The live UI scale is part of it: geometry is in device pixels now, so a
 -- mid-session scale change must re-lay-out even though no setting changed.
-local function BuildBuffSignature(buffs, maxBuffsToDisplay)
+-- iconSize is passed per bar (player/target sizes split).
+local function BuildBuffSignature(buffs, maxBuffsToDisplay, iconSize)
     local s = BuffSettingsWindow.settings
-    local parts = { s.iconSize, s.iconSpacing, s.fontSize, s.maxBuffsShown, GetUIScaleSafe() }
+    local parts = { iconSize, s.iconSpacing, s.fontSize, s.maxBuffsShown, GetUIScaleSafe() }
     for i = 1, maxBuffsToDisplay do
         parts[#parts + 1] = buffs[i].buff_id or 0
         parts[#parts + 1] = buffs[i].isBuff and 1 or 0
@@ -604,20 +761,17 @@ local function UpdateBuffsPosition(unitType, dt)
     if unitType == "player" and s.playerBarMode == "fixed" then
         if playerBarUnlocked then return end -- drag owns the anchors while moving
         local pos = s.playerBarPos or { 0, 0 }
-        local sig = tostring(pos[1]) .. "," .. tostring(pos[2])
-        if lastFixedAnchorSig ~= sig then
-            lastFixedAnchorSig = sig
-            previousPlayerXYZString = "" -- head mode must re-anchor if re-enabled
-            playerBuffCanvas:RemoveAllAnchors()
-            playerBuffCanvas:AddAnchor("TOPLEFT", "UIParent", "TOPLEFT", pos[1], pos[2])
+        -- Settle-gated re-anchor, mirroring UpdateStaticBarPosition exactly
+        local ax, ay = ClampToScreen(pos[1], pos[2])
+        previousPlayerXYZString = "" -- head mode must re-anchor if re-enabled
+        if not pinSettled or ax ~= lastFixedAppliedX or ay ~= lastFixedAppliedY then
+            lastFixedAppliedX, lastFixedAppliedY = ax, ay
+            SetPinnedPosition(playerBuffCanvas, ax, ay)
         end
         playerBuffCanvas:Show(true)
         return
     end
 
-    if unitType == "player" then
-        lastFixedAnchorSig = "" -- fixed mode must re-anchor if re-enabled
-    end
 
     local x, y, z = api.Unit:GetUnitScreenPosition(unitType)
 
@@ -818,13 +972,33 @@ local function UpdateBuffsPosition(unitType, dt)
     end
 end
 
+-- The static bar is fixed-screen ONLY: the same anchoring as the player bar's
+-- fixed mode above, with its own saved position and unlock flag, and none of
+-- the projection machinery - nothing in the world can move it.
+local function UpdateStaticBarPosition()
+    if staticBarUnlocked then return end -- drag owns the anchors while moving
+    local pos = BuffSettingsWindow.settings.staticBarPos or { 0, 0 }
+    local ax, ay = ClampToScreen(pos[1], pos[2])
+    -- Per frame until the session settles, on-change after (see the settle
+    -- gate declaration). Anchors laid during the loading screen resolve
+    -- wrong under UI scaling and every one-shot scheme fired too early, so
+    -- the bar keeps re-anchoring - the head bar's own self-heal - until the
+    -- world has been live for PIN_SETTLE_MS; from then on the target only
+    -- changes when a drag saves a new position.
+    if not pinSettled or ax ~= lastStaticAppliedX or ay ~= lastStaticAppliedY then
+        lastStaticAppliedX, lastStaticAppliedY = ax, ay
+        SetPinnedPosition(staticBuffCanvas, ax, ay)
+    end
+    staticBuffCanvas:Show(true)
+end
+
 
 local blinkTimer = 0
 local BLINK_CYCLE = math.pi * 2 -- Full cycle for sin()
 
---- Function to update the blink timer based on player and target buffs
-local function UpdateBlinkTimer(playerBuffs, targetBuffs, dt)
-    if #playerBuffs > 0 or #targetBuffs > 0 then
+--- Function to update the blink timer based on player, target and static buffs
+local function UpdateBlinkTimer(playerBuffs, targetBuffs, staticBuffs, dt)
+    if #playerBuffs > 0 or #targetBuffs > 0 or #staticBuffs > 0 then
         blinkTimer = blinkTimer + dt / 1000
         
         if blinkTimer >= BLINK_CYCLE then
@@ -880,6 +1054,18 @@ end
 
 -- Update event to handle buff/debuff updates
 local function OnUpdate(dt)
+    -- Advance the pinned-bar settle clock only while the world renders:
+    -- one projection read per frame, and none at all once settled
+    if not pinSettled then
+        local wx, wy, wz = api.Unit:GetUnitScreenPosition("player")
+        if isFiniteNumber(wx) and isFiniteNumber(wy) and isFiniteNumber(wz) then
+            pinSettleMs = pinSettleMs + (dt or 0)
+            if pinSettleMs >= PIN_SETTLE_MS then
+                pinSettled = true
+            end
+        end
+    end
+
     -- If active will track buffs
     BuffsLogger.Track(dt)
 
@@ -890,18 +1076,21 @@ local function OnUpdate(dt)
     local isSelfTarget = (playerUnitId == targetUnitId)
 
     -- Collect all watched buffs and debuffs
-    local playerBuffs, targetBuffs = CollectWatchedBuffsAndDebuffs()
+    local playerBuffs, targetBuffs, staticBuffs = CollectWatchedBuffsAndDebuffs()
     -- Update blink timer
-    UpdateBlinkTimer(playerBuffs, targetBuffs, dt)
+    UpdateBlinkTimer(playerBuffs, targetBuffs, staticBuffs, dt)
 
     -- ## PLAYER Update position and show player buffs/debuffs ##------
     if #playerBuffs > 0 then
         local maxPlayerBuffsToDisplay = math.min(#playerBuffs, BuffSettingsWindow.settings.maxBuffsShown)
 
-        local sig = BuildBuffSignature(playerBuffs, maxPlayerBuffsToDisplay)
+        local sig = BuildBuffSignature(playerBuffs, maxPlayerBuffsToDisplay, BuffSettingsWindow.settings.iconSize)
         if sig ~= lastPlayerBuffSig then
             lastPlayerBuffSig = sig
-            PositionBuffs(playerBuffs, playerBuffCanvas, playerBuffIcons, playerBuffLabels, playerBuffStackLabels)
+            -- Constant footprint only when pinned to a screen point; head
+            -- mode re-anchors every frame and must stay content-sized
+            PositionBuffs(playerBuffs, playerBuffCanvas, playerBuffIcons, playerBuffLabels, playerBuffStackLabels, BuffSettingsWindow.settings.iconSize,
+                BuffSettingsWindow.settings.playerBarMode == "fixed")
             ApplyBuffSkins(playerBuffs, playerBuffIcons, maxPlayerBuffsToDisplay)
             HideUnusedBuffSlots(playerBuffIcons, playerBuffLabels, playerBuffStackLabels, maxPlayerBuffsToDisplay)
         end
@@ -920,10 +1109,10 @@ local function OnUpdate(dt)
     if not isSelfTarget and #targetBuffs > 0 then
         local maxTargetBuffsToDisplay = math.min(#targetBuffs, BuffSettingsWindow.settings.maxBuffsShown)
 
-        local sig = BuildBuffSignature(targetBuffs, maxTargetBuffsToDisplay)
+        local sig = BuildBuffSignature(targetBuffs, maxTargetBuffsToDisplay, BuffSettingsWindow.settings.targetIconSize)
         if sig ~= lastTargetBuffSig then
             lastTargetBuffSig = sig
-            PositionBuffs(targetBuffs, targetBuffCanvas, targetBuffIcons, targetBuffLabels, targetBuffStackLabels)
+            PositionBuffs(targetBuffs, targetBuffCanvas, targetBuffIcons, targetBuffLabels, targetBuffStackLabels, BuffSettingsWindow.settings.targetIconSize)
             ApplyBuffSkins(targetBuffs, targetBuffIcons, maxTargetBuffsToDisplay)
             HideUnusedBuffSlots(targetBuffIcons, targetBuffLabels, targetBuffStackLabels, maxTargetBuffsToDisplay)
         end
@@ -932,6 +1121,33 @@ local function OnUpdate(dt)
     else
         lastTargetBuffSig = ""
         targetBuffCanvas:Show(false)
+    end
+    -- ##---------------------------------------------------------------------------------
+
+    -- ## STATIC bar: the player's second, fixed bar ##------
+    -- staticBuffs is only populated while the bar is enabled (see the collect
+    -- pass), so a disabled bar always lands in the else-hide here. Sized by
+    -- its own slider (staticIconSize, in the Configure popup) since the bars
+    -- stopped sharing the player size.
+    if #staticBuffs > 0 then
+        local maxStaticBuffsToDisplay = math.min(#staticBuffs, BuffSettingsWindow.settings.maxBuffsShown)
+
+        local sig = BuildBuffSignature(staticBuffs, maxStaticBuffsToDisplay, BuffSettingsWindow.settings.staticIconSize)
+        if sig ~= lastStaticBuffSig then
+            lastStaticBuffSig = sig
+            -- Always pinned to a screen point, so always a constant footprint
+            PositionBuffs(staticBuffs, staticBuffCanvas, staticBuffIcons, staticBuffLabels, staticBuffStackLabels, BuffSettingsWindow.settings.staticIconSize, true)
+            ApplyBuffSkins(staticBuffs, staticBuffIcons, maxStaticBuffsToDisplay)
+            HideUnusedBuffSlots(staticBuffIcons, staticBuffLabels, staticBuffStackLabels, maxStaticBuffsToDisplay)
+        end
+        UpdateBuffIconsAndTimers(staticBuffs, staticBuffIcons, staticBuffLabels, staticBuffStackLabels, maxStaticBuffsToDisplay, blinkTimer)
+        UpdateStaticBarPosition()
+    else
+        lastStaticBuffSig = ""
+        -- Keep the canvas visible while the user is drag-placing the bar
+        if not staticBarUnlocked then
+            staticBuffCanvas:Show(false)
+        end
     end
     -- ##---------------------------------------------------------------------------------
 end
@@ -996,6 +1212,12 @@ local function OnPlayerBarUnlockToggle()
     if playerBarUnlocked then
         -- Dragging only makes sense for a fixed screen position
         BuffSettingsWindow.settings.playerBarMode = "fixed"
+        -- Guarantee the TOPLEFT anchor StartMoving will update: coming out
+        -- of head mode the canvas still carries head mode's BOTTOM anchor,
+        -- and saving THAT anchor's offset as a TOPLEFT position is the
+        -- half-width-right, full-height-down jump at "Done moving"
+        PrepareFixedBarDrag(playerBuffCanvas, BuffSettingsWindow.settings.playerBarPos,
+            BuffSettingsWindow.settings.iconSize)
         if not playerBuffCanvas.dragBackdrop then
             local bd = playerBuffCanvas:CreateColorDrawable(0, 0.75, 0.75, 0.35, "background")
             bd:AddAnchor("TOPLEFT", playerBuffCanvas, 0, 0)
@@ -1005,7 +1227,6 @@ local function OnPlayerBarUnlockToggle()
         playerBuffCanvas.dragBackdrop:SetVisible(true)
         playerBuffCanvas:Clickable(true)
         if playerBuffCanvas.EnableDrag then playerBuffCanvas:EnableDrag(true) end
-        lastFixedAnchorSig = "" -- make fixed mode re-anchor once on lock
         playerBuffCanvas:Show(true)
     else
         if playerBuffCanvas.dragBackdrop then
@@ -1013,6 +1234,44 @@ local function OnPlayerBarUnlockToggle()
         end
         playerBuffCanvas:Clickable(false)
         if playerBuffCanvas.EnableDrag then playerBuffCanvas:EnableDrag(false) end
+        BuffSettingsWindow.SaveSettings()
+    end
+end
+
+-- Mirror of OnPlayerBarUnlockToggle for the static bar, minus the mode
+-- forcing: the static bar has no head mode to leave.
+local function OnStaticBarUnlockToggle()
+    if not staticBuffCanvas then
+        staticBarUnlocked = false
+        return
+    end
+    staticBarUnlocked = not staticBarUnlocked
+
+    if staticBarUnlocked then
+        if not staticBuffCanvas.dragBackdrop then
+            -- Violet like the settings window's static accents, so the two
+            -- drag boxes cannot be confused when both bars are unlocked
+            local bd = staticBuffCanvas:CreateColorDrawable(0.55, 0.42, 0.80, 0.35, "background")
+            bd:AddAnchor("TOPLEFT", staticBuffCanvas, 0, 0)
+            bd:AddAnchor("BOTTOMRIGHT", staticBuffCanvas, 0, 0)
+            staticBuffCanvas.dragBackdrop = bd
+        end
+        -- Guarantee the TOPLEFT anchor StartMoving will update: a bar whose
+        -- list has never had buffs while locked has NEVER been anchored -
+        -- the canvases are born anchorless - and dragging an anchorless
+        -- widget is what poisoned the save in the place-it-first workflow
+        PrepareFixedBarDrag(staticBuffCanvas, BuffSettingsWindow.settings.staticBarPos,
+            BuffSettingsWindow.settings.staticIconSize)
+        staticBuffCanvas.dragBackdrop:SetVisible(true)
+        staticBuffCanvas:Clickable(true)
+        if staticBuffCanvas.EnableDrag then staticBuffCanvas:EnableDrag(true) end
+        staticBuffCanvas:Show(true)
+    else
+        if staticBuffCanvas.dragBackdrop then
+            staticBuffCanvas.dragBackdrop:SetVisible(false)
+        end
+        staticBuffCanvas:Clickable(false)
+        if staticBuffCanvas.EnableDrag then staticBuffCanvas:EnableDrag(false) end
         BuffSettingsWindow.SaveSettings()
     end
 end
@@ -1199,24 +1458,57 @@ local function OnLoad()
     -- Px is best effort here (the scale is not readable at load time); the
     -- first PositionBuffs pass re-sizes with the real scale
     playerBuffCanvas:SetExtent(Px(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing), Px(BuffSettingsWindow.settings.iconSize))
+    -- Anchored from creation, like dawnsdrop's canvas (dawnsdrop_view.lua:2
+    -- anchors right after CreateEmptyWindow). A widget whose FIRST-ever
+    -- anchor comes later - especially while hidden - is what resolves
+    -- wrong; every later SetPinnedPosition is then a RE-anchor of an
+    -- already-resolved widget, the operation that demonstrably works
+    -- ("Move bar" always landed right). Head mode re-anchors per frame, so
+    -- seeding the player canvas here is harmless in that mode.
+    do
+        local pp = BuffSettingsWindow.settings.playerBarPos or { 0, 0 }
+        SetPinnedPosition(playerBuffCanvas, ClampToScreen(pp[1], pp[2]))
+    end
     playerBuffCanvas:Show(false)
     playerBuffCanvas:Clickable(false)
 
     targetBuffCanvas = api.Interface:CreateEmptyWindow("targetBuffCanvas")
-    targetBuffCanvas:SetExtent(Px(BuffSettingsWindow.settings.iconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing), Px(BuffSettingsWindow.settings.iconSize))
+    targetBuffCanvas:SetExtent(Px(BuffSettingsWindow.settings.targetIconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing), Px(BuffSettingsWindow.settings.targetIconSize))
     targetBuffCanvas:Show(false)
     targetBuffCanvas:Clickable(false)
-    
+
+    -- Sized by its own staticIconSize (best effort at load, like the others)
+    staticBuffCanvas = api.Interface:CreateEmptyWindow("staticBuffCanvas")
+    staticBuffCanvas:SetExtent(Px(BuffSettingsWindow.settings.staticIconSize * BuffSettingsWindow.settings.maxBuffsShown + (BuffSettingsWindow.settings.maxBuffsShown - 1) * BuffSettingsWindow.settings.iconSpacing), Px(BuffSettingsWindow.settings.staticIconSize))
+    -- Anchored from creation; see playerBuffCanvas above
+    do
+        local sp = BuffSettingsWindow.settings.staticBarPos or { 0, 0 }
+        SetPinnedPosition(staticBuffCanvas, ClampToScreen(sp[1], sp[2]))
+    end
+    staticBuffCanvas:Show(false)
+    staticBuffCanvas:Clickable(false)
+
     -- Create buff canvases
     for i = 1, BuffSettingsWindow.MAX_BUFFS_COUNT do
         playerBuffIcons[i], playerBuffLabels[i], playerBuffStackLabels[i] = CreateBuffElement(i, playerBuffCanvas)
         targetBuffIcons[i], targetBuffLabels[i], targetBuffStackLabels[i] = CreateBuffElement(i, targetBuffCanvas)
+        staticBuffIcons[i], staticBuffLabels[i], staticBuffStackLabels[i] = CreateBuffElement(i, staticBuffCanvas)
     end
     
     -- Drag-to-place for the player bar (active only while unlocked)
     playerBuffCanvas:SetHandler("OnDragStart", function(self)
         if not playerBarUnlocked then return end
-        self:RemoveAllAnchors()
+        -- NO RemoveAllAnchors here. StartMoving on a still-anchored widget
+        -- updates that widget's ANCHOR OFFSET, which is what keeps GetOffset
+        -- and AddAnchor speaking the same space - the pairing every working
+        -- addon relies on (CooldawnBuffTracker/canvas_factory.lua:245,
+        -- power_ranger_on/node_tracker.lua:890, sticky_ui). Stripping the
+        -- anchors first, which TTP has always done here, leaves the widget
+        -- positioned by another mechanism: GetOffset then reports the
+        -- scale-divided value the dump caught, and saving it drifted the bar
+        -- on every placement. The unlock handler has already re-anchored
+        -- TOPLEFT (PrepareFixedBarDrag), so the anchor being updated is the
+        -- one the restore writes back.
         self:StartMoving()
         api.Cursor:ClearCursor()
         api.Cursor:SetCursorImage(CURSOR_PATH.MOVE, 0, 0)
@@ -1225,10 +1517,43 @@ local function OnLoad()
         if not playerBarUnlocked then return end
         self:StopMovingOrSizing()
         api.Cursor:ClearCursor()
-        local px, py = self:GetOffset()
+        -- Dawnsdrop's save (dawnsdrop_view.lua:59 + UpdatePos): GetOffset
+        -- raw, floored, saved, immediately re-applied through
+        -- SetPinnedPosition. What is on screen after the drop IS the saved
+        -- position; a mismatch would show at mouse release, not next reload.
+        local ox, oy = self:GetOffset()
+        local px, py = ClampToScreen(ox, oy)
         BuffSettingsWindow.settings.playerBarPos = { px, py }
         BuffSettingsWindow.SaveSettings()
-        lastFixedAnchorSig = "" -- force re-anchor from the saved position
+        SetPinnedPosition(self, px, py)
+        lastFixedAppliedX, lastFixedAppliedY = px, py
+    end)
+
+    -- Drag-to-place for the static bar, the same pair as above with its own
+    -- unlock flag and saved position
+    staticBuffCanvas:SetHandler("OnDragStart", function(self)
+        if not staticBarUnlocked then return end
+        -- Anchors stay on through the drag; see the player handler above
+        self:StartMoving()
+        api.Cursor:ClearCursor()
+        api.Cursor:SetCursorImage(CURSOR_PATH.MOVE, 0, 0)
+    end)
+    staticBuffCanvas:SetHandler("OnDragStop", function(self)
+        if not staticBarUnlocked then return end
+        self:StopMovingOrSizing()
+        api.Cursor:ClearCursor()
+        -- Dawnsdrop's save, verbatim (dawnsdrop_view.lua:59 + main.lua
+        -- UpdatePos): GetOffset raw, floored, saved, then IMMEDIATELY
+        -- re-applied through the same SetPinnedPosition the restores use -
+        -- so what is on screen after the drop IS the saved position, and
+        -- any save/anchor mismatch would be visible the instant the mouse
+        -- releases instead of surfacing on the next reload.
+        local ox, oy = self:GetOffset()
+        local px, py = ClampToScreen(ox, oy)
+        BuffSettingsWindow.settings.staticBarPos = { px, py }
+        BuffSettingsWindow.SaveSettings()
+        SetPinnedPosition(self, px, py)
+        lastStaticAppliedX, lastStaticAppliedY = px, py
     end)
 
     api.On("UPDATE", OnUpdate)
@@ -1237,6 +1562,7 @@ local function OnLoad()
     api.On("TTP_BUFFS_LOGGING_STARTED", OnBuffsLoggingStarted)
     api.On("TTP_BUFFS_LOGGING_STOPPED", OnBuffsLoggingStopped)
     api.On("TTP_PLAYERBAR_UNLOCK", OnPlayerBarUnlockToggle)
+    api.On("TTP_STATICBAR_UNLOCK", OnStaticBarUnlockToggle)
     api.On("TTP_BARMODE_CHANGED", OnBarModeChanged)
 
     -- The floating "TrackThatPls" button is gone: the window is opened from the
@@ -1253,7 +1579,7 @@ local function OnLoad()
     local mySession = root.hudSession
     Store.Save()
 
-    local hudWidgets = { playerBuffCanvas, targetBuffCanvas }
+    local hudWidgets = { playerBuffCanvas, targetBuffCanvas, staticBuffCanvas }
     if BuffSettingsWindow.GetWindow then
         local settingsWnd = BuffSettingsWindow.GetWindow()
         if settingsWnd then table.insert(hudWidgets, settingsWnd) end
@@ -1321,6 +1647,7 @@ local function OnUnload()
         pcall(function() api.Off("TTP_BUFFS_LOGGING_STARTED", OnBuffsLoggingStarted) end)
         pcall(function() api.Off("TTP_BUFFS_LOGGING_STOPPED", OnBuffsLoggingStopped) end)
         pcall(function() api.Off("TTP_PLAYERBAR_UNLOCK", OnPlayerBarUnlockToggle) end)
+        pcall(function() api.Off("TTP_STATICBAR_UNLOCK", OnStaticBarUnlockToggle) end)
         if staleHideHandler then
             pcall(function() api.Off("UPDATE", staleHideHandler) end)
         end
@@ -1358,6 +1685,13 @@ local function OnUnload()
         targetBuffCanvas:Show(false)
         pcall(function() api.Interface:Free(targetBuffCanvas) end)
         targetBuffCanvas = nil
+    end
+
+    -- Clean up static bar UI elements
+    if staticBuffCanvas then
+        staticBuffCanvas:Show(false)
+        pcall(function() api.Interface:Free(staticBuffCanvas) end)
+        staticBuffCanvas = nil
     end
 
 end

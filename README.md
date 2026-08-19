@@ -11,6 +11,34 @@ default frames to find out whether your buff is still up.
 
 ---
 
+## What's new in 3.2
+
+- **The static bar** — a second bar for your own buffs, pinned to a fixed
+  screen spot, with its **own watched list**: a buff can be on either bar, or
+  on both. Everything about it lives in one popup behind
+  **PLAYER BAR → Static Bar** — an **Enabled/Disabled** switch, **Move
+  bar** placement, its own **icon size**, and an **Edit list** shortcut that
+  jumps the TRACKING panel to the new **Static bar** track type.
+- **Per-bar icon sizes** — the single icon-size slider split into **Player
+  icons** and **Target icons**, and the static bar sizes itself from its own
+  popup slider.
+- **Placed bars stay put** — a pinned bar (the static bar, or the player bar
+  in Fixed screen) now comes back to the exact spot you dropped it: across
+  relogs and `/reload`, and when buffs come and go — pinned bars keep a
+  constant footprint instead of re-centring on however many icons happen to
+  be up, and the box you drag is the bar's real footprint.
+- **Wider offsets** — the player/target vertical offsets now run **−100 to
+  +100**, so a bar can sit below its anchor point, not only above it.
+- **Nicer sliders** — click anywhere on a slider track to jump straight to
+  that value, fine-step with the −/+ buttons, or roll the mouse wheel over
+  it.
+- **The whole settings window at every UI scale** — panels, buttons,
+  sliders, dropdowns, the scrollbar and the buff list draw their lines in
+  device pixels now, so they stay crisp at 80% and don't go chunky at 130%.
+- **One border, not two** — the bar icons dropped the engine's slot frame
+  and wear a single one-pixel border instead, green for buffs and red for
+  debuffs, the same thickness at every UI scale.
+
 ## What's new in 3.1
 
 - **UI-scale fix** — the bars now look and sit the same at every UI scale (the
@@ -119,11 +147,33 @@ Above head is already correct.
 
 ---
 
+## The static bar
+
+A second bar for your own buffs, independent of the one above your head — the
+same buff can be tracked on either bar, or on both. It only ever uses a fixed
+screen position, so nothing in the world can move it.
+
+Everything about it lives behind **PLAYER BAR → Static Bar**:
+
+- **Enabled/Disabled** — the bar's switch. It only appears while Enabled AND
+  its list has buffs.
+- **Move bar** — shows the bar as a colored box you can drag anywhere; click
+  again to lock it in place. Placing works with the bar disabled too, so it
+  can be set up first and enabled when wanted.
+- **Icon size** — the static bar's own size, independent of the DISPLAY
+  sliders.
+- **Edit list** — jumps the TRACKING panel to the **Static bar** track type;
+  tick buffs there like on any other list.
+
+---
+
 ## Display
 
-Icon size, spacing, text size, and how many icons a bar shows, plus separate
-warn times for buffs and debuffs — the point at which an icon starts blinking to
-tell you it is about to drop. Offsets move each bar up or down independently.
+Separate icon sizes for the player and target bars (the static bar has its
+own slider in its popup), spacing, text size, and how many icons a bar shows,
+plus separate warn times for buffs and debuffs — the point at which an icon
+starts blinking to tell you it is about to drop. Offsets move each bar up or
+down independently, anywhere from −100 to +100.
 
 ---
 
