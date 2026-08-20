@@ -11,6 +11,19 @@ default frames to find out whether your buff is still up.
 
 ---
 
+## What's new in 3.2.1
+
+- **Logged buff IDs print correctly** — the logger announced new buffs with
+  IDs above 999,999 in scientific notation (`9.53429e+07` instead of
+  `95342942`), and that shortened form was also *wrong* by a few digits, so
+  the number it gave you could not be searched for. Long-standing bug, not
+  new in 3.2; short IDs were never affected.
+- **Search by ID** — the search box now matches the buff ID as well as the
+  name, so the number the logger prints in chat pastes straight in. Exact ID
+  matches sort to the top.
+- Searching for text containing `(`, `%` or other pattern characters no
+  longer errors.
+
 ## What's new in 3.2
 
 - **The static bar** — a second bar for your own buffs, pinned to a fixed

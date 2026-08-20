@@ -10,7 +10,7 @@ BuffSettingsWindow.settings = {}
 BuffSettingsWindow.MAX_BUFFS_COUNT = 13
 -- Single source for the version: main.lua's addon table and the settings-window
 -- footer both read this, so they cannot disagree.
-BuffSettingsWindow.ADDON_VERSION = "3.2"
+BuffSettingsWindow.ADDON_VERSION = "3.2.1"
 -- Blinking "recording" indicator shown left of the logging button
 local RECORDING_ICON_PATH = "../Addon/TrackThatPlease/icons/rec-button.png"
 
@@ -907,27 +907,43 @@ local function fillBuffData(buffScrollList, pageIndex, searchText)
     local count = 1
     filteredBuffs = {}
     
+    -- Search matches the NAME or the ID. The id is stringified with "%.0f"
+    -- (never tostring - see buff_logger: this client's tostring renders ~6
+    -- significant figures, so an 8-digit id becomes "9.53429e+07"), so the
+    -- number the logger announces in chat is exactly what can be typed here.
+    --
+    -- All matching is PLAIN (find's 4th arg) and the prefix tests use sub()
+    -- rather than a "^" pattern: the search box is free text, and a player
+    -- typing "(" or "%" used to hand string.find a malformed pattern, which
+    -- raises an error rather than simply not matching.
     local function addBuff(buff)
-        if searchText == "" or string.find(buff.name:lower(), searchText:lower()) then
-            -- Calculate relevance score for search results
-            local relevanceScore = 0
-            if searchText ~= "" then
-                local lowerName = buff.name:lower()
-                local lowerSearch = searchText:lower()
-                
-                -- Exact match gets highest score
-                if lowerName == lowerSearch then
-                    relevanceScore = 1000
-                -- Starts with search term gets high score
-                elseif string.find(lowerName, "^" .. lowerSearch) then
-                    relevanceScore = 500
-                -- Contains search term gets medium score
-                elseif string.find(lowerName, lowerSearch) then
-                    -- Shorter names with match get higher score
-                    relevanceScore = 100 + (100 - string.len(buff.name))
-                end
+        local relevanceScore = 0
+        local matched = (searchText == "")
+
+        if not matched then
+            local lowerName = (buff.name or ""):lower()
+            local lowerSearch = searchText:lower()
+            local idText = string.format("%.0f", tonumber(buff.id) or 0)
+
+            -- ID first: an all-digit search is almost certainly an id lookup,
+            -- and an exact id hit should outrank every name hit.
+            if idText == searchText then
+                matched, relevanceScore = true, 2000
+            elseif idText:sub(1, #searchText) == searchText then
+                matched, relevanceScore = true, 1500
+            elseif string.find(idText, searchText, 1, true) then
+                matched, relevanceScore = true, 1200
+            elseif lowerName == lowerSearch then
+                matched, relevanceScore = true, 1000
+            elseif lowerName:sub(1, #lowerSearch) == lowerSearch then
+                matched, relevanceScore = true, 500
+            elseif string.find(lowerName, lowerSearch, 1, true) then
+                -- Shorter names with match get higher score
+                matched, relevanceScore = true, 100 + (100 - string.len(buff.name or ""))
             end
-            
+        end
+
+        if matched then
             -- Add relevance score to buff data
             local buffWithScore = {
                 id = buff.id,
@@ -2637,6 +2653,12 @@ function BuffSettingsWindow.Initialize(buffsLogger)
         searchEditBox:RemoveAllAnchors()
         searchEditBox:AddAnchor("TOPLEFT", trackingPanel, 310, FIELD_ROW_Y)
     end)
+
+    addTooltip("ttpSearchTip", searchLabel,
+        "Search by NAME or by buff ID. \n" ..
+        "The ID is the number in brackets on each row, and the same \n" ..
+        "number the logger announces in chat when it finds a new buff - \n" ..
+        "paste it straight in. Exact ID matches sort to the top.")
 
     -- The search box is an engine widget, so its chrome is drawn from whichever
     -- in-game UI skin the player has selected. Paint a flat backdrop over it on the

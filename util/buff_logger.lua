@@ -71,8 +71,12 @@ local function appendNewBuff(buff, unitName, buffTooltip)
     if not buffsSet[buff.buff_id] then
         buffsSet[buff.buff_id] = entry
 
-        -- log new buffs
-        api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%s]|r = |cFFDDA0DD%s|r", tostring(entry.id), tostring(entry.name)))
+        -- log new buffs. "%.0f", never tostring: this client's tostring renders
+        -- ~6 significant figures, so an 8-digit id like 95342942 announced
+        -- itself as "9.53429e+07" and could not be typed back into the search
+        -- box. Only ids past ~6 digits were affected, which is why it looked
+        -- intermittent. Same formatter the settings store uses.
+        api.Log:Info(string.format("|cFF87CEEB => BuffLogger. New buff |r|cFFFFFFFF[%.0f]|r = |cFFDDA0DD%s|r", tonumber(entry.id) or 0, tostring(entry.name)))
 
         saveToFile()
         api:Emit("TTP_NEW_BUFF_LOGGED")
