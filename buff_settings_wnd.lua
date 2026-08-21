@@ -10,7 +10,7 @@ BuffSettingsWindow.settings = {}
 BuffSettingsWindow.MAX_BUFFS_COUNT = 13
 -- Single source for the version: main.lua's addon table and the settings-window
 -- footer both read this, so they cannot disagree.
-BuffSettingsWindow.ADDON_VERSION = "3.2.1"
+BuffSettingsWindow.ADDON_VERSION = "3.2.2"
 -- Blinking "recording" indicator shown left of the logging button
 local RECORDING_ICON_PATH = "../Addon/TrackThatPlease/icons/rec-button.png"
 
@@ -60,9 +60,14 @@ local LEGACY_DEAD_KEYS = {
 -- would index past the end of the icon arrays in main.lua).
 local SETTING_CLAMPS = {
     fontSize = { 10, 36 },
-    iconSize = { 25, 58 },
-    targetIconSize = { 25, 58 },
-    staticIconSize = { 25, 58 },
+    -- 10..60: the old floor of 25 was well above what a compact bar wants.
+    -- Widened rather than shifted, so every stored size stays valid and
+    -- nothing needs migrating. The floor is 10 rather than lower because the
+    -- timer and stack text have their own size sliders and do not shrink with
+    -- the icon - below ~10 they simply overflow it.
+    iconSize = { 10, 60 },
+    targetIconSize = { 10, 60 },
+    staticIconSize = { 10, 60 },
     iconSpacing = { 1, 10 },
     maxBuffsShown = { 3, BuffSettingsWindow.MAX_BUFFS_COUNT },
     buffWarnTime = { 0, 10000 },
@@ -1896,11 +1901,11 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     local displayPanel = createSectionPanel("ttpDisplayPanel", 16, 42, 468, 198, "DISPLAY")
     -- Sizes the above-head player bar only; the static bar has its own slider
     -- in its Configure popup
-    createSliderRow(displayPanel, 32, "Player icons", 25, 58, s.iconSize, function(v)
+    createSliderRow(displayPanel, 32, "Player icons", 10, 60, s.iconSize, function(v)
         BuffSettingsWindow.settings.iconSize = v
         queueSave()
     end)
-    createSliderRow(displayPanel, 58, "Target icons", 25, 58, s.targetIconSize, function(v)
+    createSliderRow(displayPanel, 58, "Target icons", 10, 60, s.targetIconSize, function(v)
         BuffSettingsWindow.settings.targetIconSize = v
         queueSave()
     end)
@@ -2176,7 +2181,7 @@ function BuffSettingsWindow.Initialize(buffsLogger)
     -- for the 468-wide panels and would run 156 units past this popup's edge.
     -- Every x here is derived left-to-right inside popW = 300, with the step
     -- buttons following the track automatically (see makeStepBtn).
-    createSliderRow(staticCfgPopup, 104, "Icon size", 25, 58, s.staticIconSize, function(v)
+    createSliderRow(staticCfgPopup, 104, "Icon size", 10, 60, s.staticIconSize, function(v)
         BuffSettingsWindow.settings.staticIconSize = v
         queueSave()
     end, nil, { labelW = 62, trackX = 104, trackW = 118, valX = 248, valW = 40 })

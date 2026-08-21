@@ -11,6 +11,15 @@ default frames to find out whether your buff is still up.
 
 ---
 
+## What's new in 3.2.2
+
+- **Smaller icons are possible again** — the icon-size sliders now run from
+  **10** instead of 25 (still up to 60), on the player bar, the target bar and
+  the static bar. 3.2 removed the game's slot skin from the icons to get a
+  crisp one-pixel buff/debuff border, and that skin used to inset the artwork
+  inside its frame — so the same number now shows more icon, and the old floor
+  of 25 was too big for a compact bar.
+
 ## What's new in 3.2.1
 
 - **Logged buff IDs print correctly** — the logger announced new buffs with
